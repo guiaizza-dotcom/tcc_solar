@@ -1,277 +1,214 @@
-import sqlite3
-import os
+import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import streamlit as st
 from datetime import datetime
+import gspread
+from google.oauth2.service_account import Credentials
 
-DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'dados', 'solar.db')
+SHEET_ID = "19jK526ZMo0BPvZ6sW3U5O0faVK16rsejEkpyYMBZ7Ec"
+CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSuKaaNCw3461krN9wiYOhL01NISccPj1VMKRx6s3NdeK1G7Lj7G7tYs7C3Tr_oLcOwMCsLhsgTHrOc/pub?output=csv"
+CRED_FILE = "credenciais.json"
+EFICIENCIA = 0.85
+IRRADIANCIA_STC = 1000.0
+TARIFA_KWH = 0.75
+CUSTO_LIMPEZA = 5.00
+LIMIAR_SUJEIRA = 10.0
 
-st.set_page_config(
-    page_title="Monitor Solar — TCC",
-    page_icon="☀️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Monitor Solar TCC", page_icon="☀️", layout="wide")
+st.markdown("""<style>
+.stApp{background-color:#0a0f1e}
+h1{color:#facc15!important}
+h2,h3{color:#e2e8f0!important}
+.card{background:linear-gradient(135deg,#1e293b,#0f172a);border:1px solid #334155;border-radius:14px;padding:18px 14px;text-align:center;margin-bottom:10px}
+.card-title{font-size:11px;color:#94a3b8;margin-bottom:4px;text-transform:uppercase}
+.card-value{font-size:28px;font-weight:700;color:#f1f5f9}
+.card-unit{font-size:11px;color:#475569;margin-top:2px}
+.decision-box{border-radius:14px;padding:22px 28px;font-size:17px;font-weight:600;text-align:center;margin:8px 0 16px 0}
+.ok{background:#14532d;border:2px solid #22c55e;color:#bbf7d0}
+.alert{background:#7f1d1d;border:2px solid #ef4444;color:#fecaca}
+.warn{background:#713f12;border:2px solid #f59e0b;color:#fef3c7}
+</style>""", unsafe_allow_html=True)
 
-st.markdown("""
-<style>
-    .stApp { background-color: #0f172a; }
-    h1 { color: #facc15 !important; }
-    h2, h3 { color: #e2e8f0 !important; }
-    .card {
-        background: linear-gradient(135deg, #1e293b, #0f172a);
-        border: 1px solid #334155;
-        border-radius: 12px;
-        padding: 20px;
-        text-align: center;
-        margin-bottom: 10px;
-    }
-    .card-title { font-size: 13px; color: #94a3b8; margin-bottom: 6px; }
-    .card-value { font-size: 28px; font-weight: bold; color: #f1f5f9; }
-    .card-unit  { font-size: 13px; color: #64748b; }
-    .decision-box {
-        border-radius: 14px;
-        padding: 24px 28px;
-        font-size: 18px;
-        font-weight: bold;
-        text-align: center;
-        margin: 10px 0;
-    }
-    .decision-ok    { background: #14532d; border: 2px solid #22c55e; color: #bbf7d0; }
-    .decision-alert { background: #7f1d1d; border: 2px solid #ef4444; color: #fecaca; }
-    .decision-warn  { background: #713f12; border: 2px solid #f59e0b; color: #fef3c7; }
-</style>
-""", unsafe_allow_html=True)
-
-CORES = {
-    'limpa':    '#22c55e',
-    'suja':     '#f59e0b',
-    'prevista': '#60a5fa',
-    'perda':    '#ef4444',
-    'irrad':    '#facc15',
-}
-
-LAYOUT_BASE = dict(
-    paper_bgcolor='rgba(0,0,0,0)',
-    plot_bgcolor='rgba(0,0,0,0)',
-    font=dict(color='#e2e8f0', size=12),
-    legend=dict(bgcolor='rgba(0,0,0,0)', bordercolor='#334155', borderwidth=1),
-    margin=dict(l=20, r=20, t=40, b=20),
-    xaxis=dict(gridcolor='#1e293b', linecolor='#334155'),
-    yaxis=dict(gridcolor='#1e293b', linecolor='#334155'),
-)
-
-@st.cache_data(ttl=30)
-def carregar_medicoes():
+def gravar_potencia(potencia):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        df   = pd.read_sql_query("SELECT * FROM medicoes ORDER BY timestamp DESC", conn)
-        conn.close()
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_file(CRED_FILE, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SHEET_ID)
+        ws = sh.sheet1
+        ws.update("H2", [[potencia]])
+        return True
+    except Exception as e:
+        st.error(f"Erro ao gravar na planilha: {e}")
+        return False
+
+@st.cache_data(ttl=60)
+def carregar_sheets():
+    try:
+        df = pd.read_csv(CSV_URL)
+        df.columns = [c.strip() for c in df.columns]
+        rename = {}
+        for col in df.columns:
+            cl = col.lower()
+            if "data" in cl or "hora" in cl: rename[col] = "timestamp"
+            elif "nuven" in cl: rename[col] = "nuvens_pct"
+            elif "temp" in cl: rename[col] = "temp_ambiente"
+            elif "irradi" in cl: rename[col] = "irradiancia"
+            elif "gera" in cl or "estimad" in cl: rename[col] = "geracao_estimada"
+        df = df.rename(columns=rename)
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+            df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
+        for col in ["nuvens_pct","temp_ambiente","irradiancia","geracao_estimada"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col].astype(str).str.replace(",","."), errors="coerce").fillna(0)
         return df
     except Exception as e:
-        st.error(f"Erro ao carregar medições: {e}")
+        st.error(f"Erro ao carregar planilha: {e}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=30)
-def carregar_analises():
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        df   = pd.read_sql_query("SELECT * FROM analise_limpeza ORDER BY timestamp DESC", conn)
-        conn.close()
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        return df
-    except Exception as e:
-        st.error(f"Erro ao carregar análises: {e}")
-        return pd.DataFrame()
+def analisar(df, potencia_w):
+    rows = []
+    for _, row in df.iterrows():
+        irrad = row.get("irradiancia", 0)
+        ger_est = row.get("geracao_estimada", 0)
+        ger_prev = ger_est
+        ger_real = round((irrad / IRRADIANCIA_STC) * potencia_w * EFICIENCIA, 3)
+        perda = max(0, round((ger_prev - ger_real) / ger_prev * 100, 2) if ger_prev > 0 else 0)
+        ind = perda > LIMIAR_SUJEIRA
+        p_fin = round((ger_prev - ger_real) * 0.25 / 1000 * TARIFA_KWH, 4)
+        p_dia = p_fin * 48
+        comp = ind and (p_dia > CUSTO_LIMPEZA)
+        if not ind: msg = "Placa OK. Limpeza nao necessaria."
+        elif comp: msg = f"Sujeira! Perda {perda:.1f}%. Perda diaria R${p_dia:.2f}. COMPENSA LIMPAR."
+        else: msg = f"Sujeira ({perda:.1f}%). Perda R${p_dia:.2f} menor que limpeza R${CUSTO_LIMPEZA:.2f}. Aguardar."
+        rows.append({"geracao_prevista":ger_prev,"geracao_real":round(ger_real,3),"perda_percentual":perda,"indicativo_sujeira":ind,"perda_financeira":p_fin,"compensa_limpar":comp,"mensagem_status":msg})
+    return pd.DataFrame(rows)
 
-def card(titulo, valor, unidade=''):
-    st.markdown(f"""
-    <div class="card">
-        <div class="card-title">{titulo}</div>
-        <div class="card-value">{valor}</div>
-        <div class="card-unit">{unidade}</div>
-    </div>
-    """, unsafe_allow_html=True)
+def card(titulo, valor, unidade="", cor="#f1f5f9"):
+    st.markdown(f'<div class="card"><div class="card-title">{titulo}</div><div class="card-value" style="color:{cor}">{valor}</div><div class="card-unit">{unidade}</div></div>', unsafe_allow_html=True)
 
-def caixa_decisao(mensagem, compensa, indicativo):
-    if not indicativo:
-        classe = "decision-ok"
-    elif compensa:
-        classe = "decision-alert"
-    else:
-        classe = "decision-warn"
-    st.markdown(f'<div class="decision-box {classe}">{mensagem}</div>', unsafe_allow_html=True)
-
-def grafico_potencia(df):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['potencia_limpa'],
-        name='Placa Limpa', mode='lines', line=dict(color=CORES['limpa'], width=2)))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['potencia_suja'],
-        name='Placa Suja', mode='lines', line=dict(color=CORES['suja'], width=2)))
-    fig.update_layout(**LAYOUT_BASE, title='Potência Gerada — Placa Limpa vs Suja (W)',
-        yaxis_title='Potência (W)', xaxis_title='Data/Hora', hovermode='x unified')
-    return fig
-
-def grafico_geracao(df):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['geracao_prevista'],
-        name='Prevista', mode='lines', line=dict(color=CORES['prevista'], width=2, dash='dash')))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['geracao_real'],
-        name='Real', mode='lines', line=dict(color=CORES['suja'], width=2)))
-    fig.add_trace(go.Scatter(
-        x=pd.concat([df['timestamp'], df['timestamp'][::-1]]),
-        y=pd.concat([df['geracao_prevista'], df['geracao_real'][::-1]]),
-        fill='toself', fillcolor='rgba(239,68,68,0.15)',
-        line=dict(color='rgba(0,0,0,0)'), name='Área de Perda', hoverinfo='skip'))
-    fig.update_layout(**LAYOUT_BASE, title='Geração Prevista vs Real (W)',
-        yaxis_title='Potência (W)', xaxis_title='Data/Hora', hovermode='x unified')
-    return fig
-
-def grafico_perda(df):
-    cores = [CORES['perda'] if v > 10 else CORES['limpa'] for v in df['perda_percentual']]
-    fig   = go.Figure(go.Bar(x=df['timestamp'], y=df['perda_percentual'],
-        marker_color=cores, name='Perda (%)'))
-    fig.add_hline(y=10, line_dash='dash', line_color='#facc15',
-        annotation_text='Limiar de sujeira (10%)', annotation_position='top right',
-        annotation_font_color='#facc15')
-    fig.update_layout(**LAYOUT_BASE, title='Perda Percentual por Sujeira (%)',
-        yaxis_title='Perda (%)', xaxis_title='Data/Hora')
-    return fig
-
-def grafico_irradiancia(df):
-    fig = go.Figure(go.Scatter(x=df['timestamp'], y=df['irradiancia'],
-        fill='tozeroy', fillcolor='rgba(250,204,21,0.2)',
-        line=dict(color=CORES['irrad'], width=2), name='Irradiância'))
-    fig.update_layout(**LAYOUT_BASE, title='Irradiância Solar (W/m²)',
-        yaxis_title='W/m²', xaxis_title='Data/Hora')
-    return fig
-
-def grafico_temperatura(df):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['temp_ambiente'],
-        name='Ambiente', mode='lines', line=dict(color='#94a3b8', width=1, dash='dot')))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['temp_placa_limpa'],
-        name='Placa Limpa', mode='lines', line=dict(color=CORES['limpa'], width=2)))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['temp_placa_suja'],
-        name='Placa Suja', mode='lines', line=dict(color=CORES['suja'], width=2)))
-    fig.update_layout(**LAYOUT_BASE, title='Temperatura (°C)',
-        yaxis_title='Temperatura (°C)', xaxis_title='Data/Hora', hovermode='x unified')
-    return fig
+LAY = dict(paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",font=dict(color="#cbd5e1",size=12),legend=dict(bgcolor="rgba(0,0,0,0)",bordercolor="#334155",borderwidth=1),margin=dict(l=10,r=10,t=36,b=10),xaxis=dict(gridcolor="#1e293b",linecolor="#334155"),yaxis=dict(gridcolor="#1e293b",linecolor="#334155"),hovermode="x unified")
 
 def main():
-    st.title("☀️ Monitor de Placas Fotovoltaicas")
-    st.markdown("**Sistema inteligente de detecção de sujeira e análise de viabilidade econômica**")
+    st.markdown('<h1 style="margin:0">☀️ Monitor de Placas Fotovoltaicas</h1>', unsafe_allow_html=True)
+    st.markdown("**Sistema inteligente de deteccao de sujeira e analise de viabilidade economica**")
     st.markdown("---")
 
-    df_med = carregar_medicoes()
-    df_ana = carregar_analises()
+    df = carregar_sheets()
 
     with st.sidebar:
-        st.title("⚙️ Configurações")
+        st.title("Configuracoes")
         st.markdown("---")
-        st.subheader("📅 Filtrar Período")
-
-        if not df_med.empty:
-            data_min = df_med['timestamp'].min().date()
-            data_max = df_med['timestamp'].max().date()
-            data_ini = st.date_input("De:", value=data_min, min_value=data_min, max_value=data_max)
-            data_fim = st.date_input("Até:", value=data_max, min_value=data_min, max_value=data_max)
-
+        st.subheader("⚡ Minha Placa")
+        potencia_cliente = st.number_input(
+            "Potencia da minha placa (W):",
+            min_value=1.0, max_value=50000.0,
+            value=20.0, step=10.0
+        )
+        if st.button("Salvar potencia na planilha", use_container_width=True):
+            if gravar_potencia(potencia_cliente):
+                st.success(f"Potencia {potencia_cliente}W salva na planilha!")
+                st.cache_data.clear()
+                st.rerun()
         st.markdown("---")
-        st.subheader("ℹ️ Sobre o Projeto")
-        st.markdown("""
-        **TCC — Detecção de Sujeira em Placas Fotovoltaicas**
-        - 2 Placas de 20W
-        - Monitoramento contínuo
-        - Análise econômica automática
-        """)
+        if not df.empty and "timestamp" in df.columns:
+            st.subheader("Periodo")
+            dmin = df["timestamp"].min().date()
+            dmax = df["timestamp"].max().date()
+            d1 = st.date_input("De:", value=dmin, min_value=dmin, max_value=dmax)
+            d2 = st.date_input("Ate:", value=dmax, min_value=dmin, max_value=dmax)
         st.markdown("---")
-        if st.button("🔄 Atualizar Dados", use_container_width=True):
+        st.markdown("**TCC Solar**\n- Dados via API climatica\n- Python + Streamlit")
+        st.markdown("---")
+        if st.button("Atualizar dados", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
-        st.caption(f"Última atualização: {datetime.now().strftime('%H:%M:%S')}")
+        st.caption(f"Atualizado: {datetime.now().strftime('%H:%M:%S')}")
 
-    if df_med.empty or df_ana.empty:
-        st.warning("Banco de dados vazio. Execute inserir_dados_teste.py primeiro.")
+    if df.empty:
+        st.warning("Sem dados da planilha.")
         st.stop()
 
-    mask_med = (df_med['timestamp'].dt.date >= data_ini) & (df_med['timestamp'].dt.date <= data_fim)
-    mask_ana = (df_ana['timestamp'].dt.date >= data_ini) & (df_ana['timestamp'].dt.date <= data_fim)
-    df_med_f = df_med[mask_med].copy()
-    df_ana_f = df_ana[mask_ana].copy()
+    mask = (df["timestamp"].dt.date >= d1) & (df["timestamp"].dt.date <= d2)
+    df = df[mask].copy()
 
-    if df_med_f.empty:
-        st.warning("Nenhum dado para o período selecionado.")
+    if df.empty:
+        st.warning("Nenhum dado para o periodo.")
         st.stop()
 
-    ultima_med = df_med_f.iloc[0]
-    ultima_ana = df_ana_f.iloc[0]
+    an = analisar(df, potencia_cliente)
+    ultima = df.iloc[-1]
+    ult_an = an.iloc[-1]
 
-    st.subheader("🧠 Diagnóstico Atual")
-    caixa_decisao(ultima_ana['mensagem_status'], int(ultima_ana['compensa_limpar']), int(ultima_ana['indicativo_sujeira']))
-    st.markdown("---")
+    st.info(f"Calculando para uma placa de {potencia_cliente:.0f}W — Geracao maxima esperada: {potencia_cliente * EFICIENCIA:.1f}W em condicoes ideais")
 
-    st.subheader("📊 Indicadores em Tempo Real")
-    col1, col2, col3, col4 = st.columns(4)
-    with col1: card("⚡ Potência — Placa Limpa", f"{ultima_med['potencia_limpa']:.2f}", "W")
-    with col2: card("⚡ Potência — Placa Suja",  f"{ultima_med['potencia_suja']:.2f}",  "W")
-    with col3: card("📉 Perda por Sujeira",       f"{ultima_ana['perda_percentual']:.1f}", "%")
-    with col4: card("☀️ Irradiância",             f"{ultima_med['irradiancia']:.0f}", "W/m²")
+    st.subheader("Diagnostico Atual")
+    cls = "alert" if ult_an["compensa_limpar"] else ("warn" if ult_an["indicativo_sujeira"] else "ok")
+    st.markdown(f'<div class="decision-box {cls}">{ult_an["mensagem_status"]}</div>', unsafe_allow_html=True)
 
-    st.markdown("")
-    col5, col6, col7, col8 = st.columns(4)
-    with col5: card("🌡️ Temp. Ambiente",     f"{ultima_med['temp_ambiente']:.1f}",    "°C")
-    with col6: card("🌡️ Temp. Placa Limpa", f"{ultima_med['temp_placa_limpa']:.1f}", "°C")
-    with col7: card("🌡️ Temp. Placa Suja",  f"{ultima_med['temp_placa_suja']:.1f}",  "°C")
-    with col8: card("💰 Perda Diária Est.", f"R$ {ultima_ana['perda_financeira']*48:.2f}", "estimada")
+    st.subheader("Indicadores em Tempo Real")
+    c1,c2,c3,c4,c5 = st.columns(5)
+    with c1: card("Irradiancia", f"{ultima.get('irradiancia',0):.0f}", "W/m2", "#facc15")
+    with c2: card("Geracao Prevista", f"{ult_an['geracao_prevista']:.1f}", "W", "#60a5fa")
+    with c3: card("Geracao Real", f"{ult_an['geracao_real']:.1f}", "W", "#f59e0b")
+    with c4:
+        cor = "#ef4444" if ult_an["perda_percentual"] > LIMIAR_SUJEIRA else "#22c55e"
+        card("Perda Estimada", f"{ult_an['perda_percentual']:.1f}", "%", cor)
+    with c5: card("Temperatura", f"{ultima.get('temp_ambiente',0):.1f}", "C", "#34d399")
 
-    st.markdown("---")
-
-    df_med_graf = df_med_f.sort_values('timestamp')
-    df_ana_graf = df_ana_f.sort_values('timestamp')
-
-    st.subheader("📈 Comparação de Potência")
-    st.plotly_chart(grafico_potencia(df_med_graf), use_container_width=True)
-
-    st.subheader("🎯 Geração Prevista vs Real")
-    st.caption("A área vermelha representa a energia perdida por sujeira.")
-    st.plotly_chart(grafico_geracao(df_ana_graf), use_container_width=True)
-
-    st.subheader("📉 Evolução da Perda por Sujeira")
-    st.plotly_chart(grafico_perda(df_ana_graf), use_container_width=True)
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.subheader("🌞 Irradiância Solar")
-        st.plotly_chart(grafico_irradiancia(df_med_graf), use_container_width=True)
-    with col_b:
-        st.subheader("🌡️ Temperatura")
-        st.plotly_chart(grafico_temperatura(df_med_graf), use_container_width=True)
+    c6,c7,c8,c9,c10 = st.columns(5)
+    with c6: card("Nuvens", f"{ultima.get('nuvens_pct',0):.0f}", "%", "#94a3b8")
+    with c7: card("Perda/Medicao", f"R$ {ult_an['perda_financeira']:.4f}", "", "#f87171")
+    with c8: card("Perda Diaria", f"R$ {ult_an['perda_financeira']*48:.2f}", "estimada", "#fb923c")
+    with c9: card("Custo Limpeza", f"R$ {CUSTO_LIMPEZA:.2f}", "", "#a78bfa")
+    with c10: card("Registros", f"{len(df)}", "no periodo", "#67e8f9")
 
     st.markdown("---")
-    st.subheader("💰 Análise Econômica do Período")
-    perda_total_kwh = (df_ana_graf['geracao_prevista'] - df_ana_graf['geracao_real']).sum() * 0.25 / 1000
-    perda_total_r   = df_ana_graf['perda_financeira'].sum()
-    custo_limpeza   = df_ana_graf['custo_limpeza'].iloc[0]
-    qtd_alertas     = df_ana_graf['indicativo_sujeira'].sum()
-    qtd_limpezas    = df_ana_graf['compensa_limpar'].sum()
+    st.subheader("Geracao Prevista vs Real")
+    fig1 = go.Figure()
+    fig1.add_trace(go.Scatter(x=df["timestamp"],y=an["geracao_prevista"],name="Prevista (API)",mode="lines",line=dict(color="#60a5fa",width=2,dash="dash")))
+    fig1.add_trace(go.Scatter(x=df["timestamp"],y=an["geracao_real"],name="Real (sua placa)",mode="lines",line=dict(color="#f59e0b",width=2)))
+    fig1.add_trace(go.Scatter(x=pd.concat([df["timestamp"],df["timestamp"][::-1]]),y=pd.concat([an["geracao_prevista"],an["geracao_real"][::-1]]),fill="toself",fillcolor="rgba(239,68,68,0.12)",line=dict(color="rgba(0,0,0,0)"),name="Area de perda",hoverinfo="skip"))
+    fig1.update_layout(**LAY,title=f"Geracao Prevista (API) vs Real (placa {potencia_cliente:.0f}W)",yaxis_title="W")
+    st.plotly_chart(fig1,use_container_width=True)
 
-    col_e1, col_e2, col_e3, col_e4 = st.columns(4)
-    with col_e1: card("🔋 Energia Perdida",        f"{perda_total_kwh:.4f}", "kWh")
-    with col_e2: card("💸 Perda Financeira Total", f"R$ {perda_total_r:.2f}", "no período")
-    with col_e3: card("⚠️ Alertas de Sujeira",     f"{int(qtd_alertas)}", "leituras")
-    with col_e4: card("🧹 Limpezas Recomendadas",  f"{int(qtd_limpezas)}", "ocorrências")
+    ca,cb = st.columns(2)
+    with ca:
+        st.subheader("Irradiancia Solar")
+        fig2 = go.Figure(go.Scatter(x=df["timestamp"],y=df["irradiancia"],fill="tozeroy",fillcolor="rgba(250,204,21,0.15)",line=dict(color="#facc15",width=2),name="Irradiancia"))
+        fig2.update_layout(**LAY,title="Irradiancia (W/m2)",yaxis_title="W/m2")
+        st.plotly_chart(fig2,use_container_width=True)
+    with cb:
+        st.subheader("Temperatura e Nuvens")
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=df["timestamp"],y=df["temp_ambiente"],name="Temperatura (C)",mode="lines",line=dict(color="#34d399",width=2)))
+        if "nuvens_pct" in df.columns:
+            fig3.add_trace(go.Bar(x=df["timestamp"],y=df["nuvens_pct"],name="Nuvens (%)",opacity=0.4,marker_color="#94a3b8",yaxis="y2"))
+        fig3.update_layout(**LAY,title="Temperatura e Nuvens",yaxis=dict(title="C",gridcolor="#1e293b",linecolor="#334155"),yaxis2=dict(title="%",overlaying="y",side="right",gridcolor="#1e293b",linecolor="#334155"))
+        st.plotly_chart(fig3,use_container_width=True)
+
+    st.subheader("Perda Estimada por Sujeira")
+    fig4 = go.Figure(go.Bar(x=df["timestamp"],y=an["perda_percentual"],marker_color=["#ef4444" if v>LIMIAR_SUJEIRA else "#22c55e" for v in an["perda_percentual"]]))
+    fig4.add_hline(y=LIMIAR_SUJEIRA,line_dash="dash",line_color="#facc15",annotation_text=f"Limiar ({LIMIAR_SUJEIRA}%)",annotation_position="top right",annotation_font_color="#facc15")
+    fig4.update_layout(**LAY,title="Perda por Sujeira (%)",yaxis_title="%")
+    st.plotly_chart(fig4,use_container_width=True)
 
     st.markdown("---")
-    with st.expander("📋 Ver Dados Brutos — Medições"):
-        st.dataframe(df_med_f.sort_values('timestamp', ascending=False).head(100), use_container_width=True)
-    with st.expander("📋 Ver Dados Brutos — Análise de Limpeza"):
-        st.dataframe(df_ana_f.sort_values('timestamp', ascending=False).head(100), use_container_width=True)
+    st.subheader("Analise Economica do Periodo")
+    perda_kwh = ((an["geracao_prevista"]-an["geracao_real"])*0.25/1000).sum()
+    perda_r = an["perda_financeira"].sum()
+    e1,e2,e3,e4 = st.columns(4)
+    with e1: card("Energia Perdida", f"{perda_kwh:.4f}", "kWh")
+    with e2: card("Perda Total", f"R$ {perda_r:.3f}", "no periodo")
+    with e3: card("Alertas Sujeira", f"{int(an['indicativo_sujeira'].sum())}", "leituras")
+    with e4: card("Limpezas Recom.", f"{int(an['compensa_limpar'].sum())}", "ocorrencias")
 
     st.markdown("---")
-    st.caption("🎓 TCC — Sistema Inteligente de Detecção de Sujeira em Placas Fotovoltaicas | Python + Streamlit + SQLite")
+    with st.expander("Ver dados da planilha"):
+        st.dataframe(df.sort_values("timestamp",ascending=False),use_container_width=True)
 
-if __name__ == '__main__':
+    st.caption("TCC Solar | Python + Streamlit + Google Sheets")
+
+if __name__ == "__main__":
     main()
