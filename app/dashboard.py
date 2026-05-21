@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
+import json
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -32,7 +33,11 @@ h2,h3{color:#e2e8f0!important}
 def gravar_potencia(potencia):
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_file(CRED_FILE, scopes=scopes)
+        if "gcp_service_account" in st.secrets:
+            creds = Credentials.from_service_account_info(
+                dict(st.secrets["gcp_service_account"]), scopes=scopes)
+        else:
+            creds = Credentials.from_service_account_file(CRED_FILE, scopes=scopes)
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(SHEET_ID)
         ws = sh.sheet1
@@ -108,7 +113,7 @@ def main():
         )
         if st.button("Salvar potencia na planilha", use_container_width=True):
             if gravar_potencia(potencia_cliente):
-                st.success(f"Potencia {potencia_cliente}W salva na planilha!")
+                st.success(f"✅ Potencia {potencia_cliente:.0f}W salva na planilha!")
                 st.cache_data.clear()
                 st.rerun()
         st.markdown("---")
