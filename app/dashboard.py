@@ -1,3 +1,39 @@
+# ============================================================================
+# 🌞 TCC SOLAR - DETECÇÃO DE SUJEIRA EM PLACAS FOTOVOLTAICAS
+# ============================================================================
+
+import streamlit as st
+
+# ============================================================================
+# ✅ CONFIGURAÇÃO DA PÁGINA (com PWA)
+# ============================================================================
+
+st.set_page_config(
+    page_title="TCC Solar - Monitoramento",
+    page_icon="☀️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        "Get Help": "https://github.com/guiaizza-dotcom/tcc_solar",
+        "Report a bug": "https://github.com/guiaizza-dotcom/tcc_solar/issues",
+        "About": "🎓 TCC - Detecção de Sujeira em Placas Fotovoltaicas"
+    }
+)
+
+# ============================================================================
+# 📱 CONFIGURAÇÃO PWA (Progressive Web App para iPhone/Android)
+# ============================================================================
+
+pwa_html = """
+<link rel="manifest" href="https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/.streamlit/app_manifest.json">
+<meta name="theme-color" content="#FFA500">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="TCC Solar">
+<link rel="apple-touch-icon" href="https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png">
+"""
+
+st.markdown(pwa_html, unsafe_allow_html=True)
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
