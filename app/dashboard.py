@@ -230,6 +230,44 @@ def enviar_notificacao_limpeza(perda, perda_diaria):
     st.markdown(notification_html, unsafe_allow_html=True)
 
 # ============================================================================
+# 🧪 TESTE DE NOTIFICAÇÃO (apenas para desenvolvimento)
+# ============================================================================
+
+def mostrar_botao_teste_notificacao():
+    """Mostra um botão para testar a notificação"""
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🧪 Teste")
+    if st.sidebar.button("📢 Testar Notificação", use_container_width=True):
+        st.sidebar.success("✅ Notificação de teste disparada!")
+        # Notificação de teste
+        notification_html = """
+        <script>
+        if ("Notification" in window) {
+            if (Notification.permission === "granted") {
+                new Notification("🚨 TESTE: LIMPEZA NECESSÁRIA!", {
+                    body: "Esta é uma notificação de teste! Perda: 25.5%. Perda diária: R$12.50. COMPENSA LIMPAR!",
+                    icon: "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
+                    badge: "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
+                    tag: "teste-notificacao"
+                });
+            } else if (Notification.permission !== "denied") {
+                Notification.requestPermission().then(permission => {
+                    if (permission === "granted") {
+                        new Notification("🚨 TESTE: LIMPEZA NECESSÁRIA!", {
+                            body: "Esta é uma notificação de teste! Perda: 25.5%. Perda diária: R$12.50. COMPENSA LIMPAR!",
+                            icon: "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
+                            badge: "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
+                            tag: "teste-notificacao"
+                        });
+                    }
+                });
+            }
+        }
+        </script>
+        """
+        st.markdown(notification_html, unsafe_allow_html=True)
+
+# ============================================================================
 # 🎯 FUNÇÃO PRINCIPAL
 # ============================================================================
 
@@ -279,6 +317,9 @@ def main():
             st.rerun()
         
         st.caption(f"Atualizado: {datetime.now().strftime('%H:%M:%S')}")
+    
+    # 🧪 BOTÃO DE TESTE DE NOTIFICAÇÃO
+    mostrar_botao_teste_notificacao()
 
     # Verificar se há dados
     if df.empty:
