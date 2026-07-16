@@ -194,43 +194,7 @@ LAY = dict(
 )
 
 # ============================================================================
-# 🔔 FUNÇÃO DE NOTIFICAÇÃO
-# ============================================================================
-
-def enviar_notificacao_limpeza(perda, perda_diaria):
-    """Envia notificação de limpeza necessária via JavaScript"""
-    notification_html = f"""
-    <script>
-    // Verificar se o navegador suporta notificações
-    if ("Notification" in window) {{
-        // Se o usuário já deu permissão, enviar notificação
-        if (Notification.permission === "granted") {{
-            new Notification("🚨 LIMPEZA NECESSÁRIA!", {{
-                body: "Perda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!",
-                icon: "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
-                badge: "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
-                tag: "limpeza-necessaria"
-            }});
-        }} else if (Notification.permission !== "denied") {{
-            // Caso contrário, pedir permissão
-            Notification.requestPermission().then(permission => {{
-                if (permission === "granted") {{
-                    new Notification("🚨 LIMPEZA NECESSÁRIA!", {{
-                        body: "Perda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!",
-                        icon: "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
-                        badge: "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
-                        tag: "limpeza-necessaria"
-                    }});
-                }}
-            }});
-        }}
-    }}
-    </script>
-    """
-    st.markdown(notification_html, unsafe_allow_html=True)
-
-# ============================================================================
-# 🧪 TESTE DE NOTIFICAÇÃO (apenas para desenvolvimento)
+# 🧪 TESTE DE NOTIFICAÇÃO (usando Streamlit, sem JavaScript)
 # ============================================================================
 
 def mostrar_botao_teste_notificacao():
@@ -238,34 +202,8 @@ def mostrar_botao_teste_notificacao():
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧪 Teste")
     if st.sidebar.button("📢 Testar Notificação", use_container_width=True):
-        st.sidebar.success("✅ Notificação de teste disparada!")
-        # Notificação de teste
-        notification_html = """
-        <script>
-        if ("Notification" in window) {
-            if (Notification.permission === "granted") {
-                new Notification("🚨 TESTE: LIMPEZA NECESSÁRIA!", {
-                    body: "Esta é uma notificação de teste! Perda: 25.5%. Perda diária: R$12.50. COMPENSA LIMPAR!",
-                    icon: "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
-                    badge: "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
-                    tag: "teste-notificacao"
-                });
-            } else if (Notification.permission !== "denied") {
-                Notification.requestPermission().then(permission => {
-                    if (permission === "granted") {
-                        new Notification("🚨 TESTE: LIMPEZA NECESSÁRIA!", {
-                            body: "Esta é uma notificação de teste! Perda: 25.5%. Perda diária: R$12.50. COMPENSA LIMPAR!",
-                            icon: "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
-                            badge: "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
-                            tag: "teste-notificacao"
-                        });
-                    }
-                });
-            }
-        }
-        </script>
-        """
-        st.markdown(notification_html, unsafe_allow_html=True)
+        st.success("✅ NOTIFICAÇÃO DE TESTE DISPARADA!")
+        st.info("📢 TESTE: LIMPEZA NECESSÁRIA!\n\nEsta é uma notificação de teste! Perda: 25.5%. Perda diária: R$12.50. COMPENSA LIMPAR!")
 
 # ============================================================================
 # 🎯 FUNÇÃO PRINCIPAL
@@ -340,13 +278,13 @@ def main():
     ult_an = an.iloc[-1]
 
     # ============================================================================
-    # 🔔 VERIFICAR SE COMPENSA LIMPAR E ENVIAR NOTIFICAÇÃO
+    # 🔔 VERIFICAR SE COMPENSA LIMPAR E MOSTRAR NOTIFICAÇÃO
     # ============================================================================
     
     if ult_an["compensa_limpar"]:
         perda = ult_an["perda_percentual"]
         perda_diaria = ult_an["perda_financeira"] * 48
-        enviar_notificacao_limpeza(perda, perda_diaria)
+        st.error(f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!")
 
     # Info box
     st.info(f"Calculando para uma placa de {potencia_cliente:.0f}W — Geração máxima esperada: {potencia_cliente * EFICIENCIA:.1f}W em condições ideais")
