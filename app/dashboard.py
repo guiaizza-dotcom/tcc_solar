@@ -122,6 +122,8 @@ def carregar_sheets():
                 rename[col] = "perda_percentual"
             elif "compensa" in cl.lower() and "limpar" in cl.lower():
                 rename[col] = "compensa_limpar_texto"
+            elif "comando" in cl and "limpeza" in cl:
+                rename[col] = "comando_limpeza"
         
         df = df.rename(columns=rename)
         
@@ -287,30 +289,40 @@ def main():
     ult_an = an.iloc[-1]
 
     # ============================================================================
-    # 🔔 LER COLUNA G DA PLANILHA (Compensa Limpar)
+    # 🔔 LER COLUNA I DA PLANILHA (Comando Limpeza) - CONTROLE MANUAL
     # ============================================================================
     
     try:
-        # Procurar pela coluna de "Compensa Limpar"
-        compensa_col = None
+        # Procurar pela coluna de "Comando Limpeza"
+        comando_col = None
         for col in df.columns:
-            if "compensa" in col.lower() and "limpar" in col.lower():
-                compensa_col = col
+            if "comando" in col.lower() and "limpeza" in col.lower():
+                comando_col = col
                 break
         
-        if compensa_col and not df.empty:
-            ultima_compensa = str(df.iloc[-1].get(compensa_col, "")).upper().strip()
+        if comando_col and not df.empty:
+            ultimo_comando = str(df.iloc[-1].get(comando_col, "")).upper().strip()
             
-            if ultima_compensa == "SIM":
+            if ultimo_comando == "SIM":
                 perda = ult_an["perda_percentual"]
                 perda_diaria = ult_an["perda_financeira"] * 48
-                st.error(f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!")
+                st.error(f"🚨 LIMPEZA NECESSÁRIA!\n\n**Comando Manual Ativado**\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!")
                 # Enviar para Thingspeak
                 enviar_para_thingspeak("SIM")
-            else:
+            elif ultimo_comando == "NÃO":
                 st.success("✅ Placa OK. Limpeza não necessária.")
                 # Enviar para Thingspeak
                 enviar_para_thingspeak("NÃO")
+            else:
+                # Se não for SIM nem NÃO, usar cálculo automático
+                if ult_an["compensa_limpar"]:
+                    perda = ult_an["perda_percentual"]
+                    perda_diaria = ult_an["perda_financeira"] * 48
+                    st.error(f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!")
+                    enviar_para_thingspeak("SIM")
+                else:
+                    st.success("✅ Placa OK. Limpeza não necessária.")
+                    enviar_para_thingspeak("NÃO")
         else:
             # Se não encontrar coluna, usar cálculo automático
             if ult_an["compensa_limpar"]:
