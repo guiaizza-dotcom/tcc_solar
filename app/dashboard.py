@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
+import requests
 
 # ============================================================================
 # ✅ CONFIGURAÇÃO DA PÁGINA (com PWA)
@@ -53,12 +54,16 @@ TARIFA_KWH = 0.75
 CUSTO_LIMPEZA = 5.00
 LIMIAR_SUJEIRA = 10.0
 
+# THINGSPEAK CONFIG (se seu amigo já configurou)
+THINGSPEAK_CHANNEL_ID = "YOUR_CHANNEL_ID"  # Substituir com seu ID
+THINGSPEAK_API_KEY = "YOUR_API_KEY"  # Substituir com sua chave
+
 # ============================================================================
 # 🎨 ESTILOS CSS
 # ============================================================================
 
 st.markdown("""<style>
-.stApp{background:linear-gradient(180deg,#2E1065 0%,#6D28D9 100%)}
+.stApp{background-color:#0a0f1e}
 h1{color:#facc15!important}
 h2,h3{color:#e2e8f0!important}
 .card{background:linear-gradient(135deg,#1e293b,#0f172a);border:1px solid #334155;border-radius:14px;padding:18px 14px;text-align:center;margin-bottom:10px}
@@ -99,34 +104,35 @@ def carregar_sheets():
     try:
         df = pd.read_csv(CSV_URL)
         df.columns = [c.strip() for c in df.columns]
-
-        # Renomear colunas
+        
         rename = {}
         for col in df.columns:
             cl = col.lower()
-            if "data" in cl or "hora" in cl:
+            if "data" in cl or "hora" in cl: 
                 rename[col] = "timestamp"
-            elif "nuven" in cl:
+            elif "nuven" in cl: 
                 rename[col] = "nuvens_pct"
-            elif "temp" in cl:
+            elif "temp" in cl: 
                 rename[col] = "temp_ambiente"
-            elif "irradi" in cl:
+            elif "irradi" in cl: 
                 rename[col] = "irradiancia"
-            elif "gera" in cl or "estimad" in cl:
+            elif "gera" in cl or "estimad" in cl: 
                 rename[col] = "geracao_estimada"
-
+            elif "perda" in cl and "percentual" in cl:
+                rename[col] = "perda_percentual"
+            elif "compensa" in cl or "limpar" in cl.lower():
+                rename[col] = "compensa_limpar_texto"
+        
         df = df.rename(columns=rename)
-
-        # Processar timestamp
+        
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
             df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
-
-        # Converter colunas numéricas
-        for col in ["nuvens_pct", "temp_ambiente", "irradiancia", "geracao_estimada"]:
+        
+        for col in ["nuvens_pct", "temp_ambiente", "irradiancia", "geracao_estimada", "perda_percentual"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", "."), errors="coerce").fillna(0)
-
+        
         return df
     except Exception as e:
         st.error(f"Erro ao carregar planilha: {e}")
@@ -140,24 +146,21 @@ def analisar(df, potencia_w):
         ger_est = row.get("geracao_estimada", 0)
         ger_prev = ger_est
         ger_real = round((irrad / IRRADIANCIA_STC) * potencia_w * EFICIENCIA, 3)
-
-        # Calcular perda percentual
+        
         perda = max(0, round((ger_prev - ger_real) / ger_prev * 100, 2) if ger_prev > 0 else 0)
         ind = perda > LIMIAR_SUJEIRA
-
-        # Perda financeira
+        
         p_fin = round((ger_prev - ger_real) * 0.25 / 1000 * TARIFA_KWH, 4)
         p_dia = p_fin * 48
         comp = ind and (p_dia > CUSTO_LIMPEZA)
-
-        # Mensagem de status
-        if not ind:
+        
+        if not ind: 
             msg = "✅ Placa OK. Limpeza não necessária."
-        elif comp:
+        elif comp: 
             msg = f"🚨 Sujeira! Perda {perda:.1f}%. Perda diária R${p_dia:.2f}. COMPENSA LIMPAR."
-        else:
+        else: 
             msg = f"⚠️ Sujeira ({perda:.1f}%). Perda R${p_dia:.2f} menor que limpeza R${CUSTO_LIMPEZA:.2f}. Aguardar."
-
+        
         rows.append({
             "geracao_prevista": ger_prev,
             "geracao_real": round(ger_real, 3),
@@ -168,15 +171,29 @@ def analisar(df, potencia_w):
             "compensa_limpar": comp,
             "mensagem_status": msg
         })
-
+    
     return pd.DataFrame(rows)
 
 def card(titulo, valor, unidade="", cor="#f1f5f9"):
     """Exibe um card com métrica"""
     st.markdown(
-        f'<div class="card"><div class="card-title">{titulo}</div><div class="card-value" style="color:{cor}">{valor}</div><div class="card-unit">{unidade}</div></div>',
+        f'<div class="card"><div class="card-title">{titulo}</div><div class="card-value" style="color:{cor}">{valor}</div><div class="card-unit">{unidade}</div></div>', 
         unsafe_allow_html=True
     )
+
+def enviar_para_thingspeak(comando):
+    """Envia comando para Thingspeak (para o ESP32 ler)"""
+    try:
+        url = f"https://api.thingspeak.com/update"
+        params = {
+            "api_key": THINGSPEAK_API_KEY,
+            "field1": comando  # "SIM" ou "NÃO"
+        }
+        response = requests.get(url, params=params)
+        return response.status_code == 200
+    except Exception as e:
+        st.warning(f"Erro ao enviar para Thingspeak: {e}")
+        return False
 
 # ============================================================================
 # 📊 CONFIGURAÇÕES DE LAYOUT DOS GRÁFICOS
@@ -194,7 +211,7 @@ LAY = dict(
 )
 
 # ============================================================================
-# 🧪 TESTE DE NOTIFICAÇÃO (usando Streamlit, sem JavaScript)
+# 🧪 TESTE DE NOTIFICAÇÃO
 # ============================================================================
 
 def mostrar_botao_teste_notificacao():
@@ -210,61 +227,54 @@ def mostrar_botao_teste_notificacao():
 # ============================================================================
 
 def main():
-    # Cabeçalho
     st.markdown('<h1 style="margin:0">☀️ Monitor de Placas Fotovoltaicas</h1>', unsafe_allow_html=True)
     st.markdown("**Sistema inteligente de detecção de sujeira e análise de viabilidade econômica**")
     st.markdown("---")
 
-    # Carregar dados
     df = carregar_sheets()
 
-    # Sidebar
     with st.sidebar:
         st.title("⚙️ Configurações")
         st.markdown("---")
-
+        
         st.subheader("⚡ Minha Placa")
         potencia_cliente = st.number_input(
             "Potência da minha placa (W):",
             min_value=1.0, max_value=50000.0,
             value=20.0, step=10.0
         )
-
+        
         if st.button("Salvar potência na planilha", use_container_width=True):
             if gravar_potencia(potencia_cliente):
                 st.success(f"✅ Potência {potencia_cliente:.0f}W salva na planilha!")
                 st.cache_data.clear()
                 st.rerun()
-
+        
         st.markdown("---")
-
-        # Filtro de período
+        
         if not df.empty and "timestamp" in df.columns:
             st.subheader("📅 Período")
             dmin = df["timestamp"].min().date()
             dmax = df["timestamp"].max().date()
             d1 = st.date_input("De:", value=dmin, min_value=dmin, max_value=dmax)
             d2 = st.date_input("Até:", value=dmax, min_value=dmin, max_value=dmax)
-
+        
         st.markdown("---")
         st.markdown("**TCC Solar**\n- Dados via API climática\n- Python + Streamlit")
         st.markdown("---")
-
+        
         if st.button("🔄 Atualizar dados", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
-
+        
         st.caption(f"Atualizado: {datetime.now().strftime('%H:%M:%S')}")
-
-    # 🧪 BOTÃO DE TESTE DE NOTIFICAÇÃO
+    
     mostrar_botao_teste_notificacao()
 
-    # Verificar se há dados
     if df.empty:
         st.warning("⚠️ Sem dados da planilha.")
         st.stop()
 
-    # Filtrar por período
     mask = (df["timestamp"].dt.date >= d1) & (df["timestamp"].dt.date <= d2)
     df = df[mask].copy()
 
@@ -272,58 +282,90 @@ def main():
         st.warning("Nenhum dado para o período selecionado.")
         st.stop()
 
-    # Análise
     an = analisar(df, potencia_cliente)
     ultima = df.iloc[-1]
     ult_an = an.iloc[-1]
 
     # ============================================================================
-    # 🔔 VERIFICAR SE COMPENSA LIMPAR E MOSTRAR NOTIFICAÇÃO
+    # 🔔 LER COLUNA G DA PLANILHA (Compensa Limpar)
     # ============================================================================
+    
+    try:
+        # Procurar pela coluna de "Compensa Limpar"
+        compensa_col = None
+        for col in df.columns:
+            if "compensa" in col.lower() and "limpar" in col.lower():
+                compensa_col = col
+                break
+        
+        if compensa_col and not df.empty:
+            ultima_compensa = str(df.iloc[-1].get(compensa_col, "")).upper().strip()
+            
+            if ultima_compensa == "SIM":
+                perda = ult_an["perda_percentual"]
+                perda_diaria = ult_an["perda_financeira"] * 48
+                st.error(f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!")
+                # Enviar para Thingspeak
+                enviar_para_thingspeak("SIM")
+            else:
+                st.success("✅ Placa OK. Limpeza não necessária.")
+                # Enviar para Thingspeak
+                enviar_para_thingspeak("NÃO")
+        else:
+            # Se não encontrar coluna, usar cálculo automático
+            if ult_an["compensa_limpar"]:
+                perda = ult_an["perda_percentual"]
+                perda_diaria = ult_an["perda_financeira"] * 48
+                st.error(f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!")
+                enviar_para_thingspeak("SIM")
+            else:
+                st.success("✅ Placa OK. Limpeza não necessária.")
+                enviar_para_thingspeak("NÃO")
+    except Exception as e:
+        # Se tiver erro, usa o cálculo automático
+        if ult_an["compensa_limpar"]:
+            perda = ult_an["perda_percentual"]
+            perda_diaria = ult_an["perda_financeira"] * 48
+            st.error(f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!")
+            enviar_para_thingspeak("SIM")
+        else:
+            st.success("✅ Placa OK. Limpeza não necessária.")
+            enviar_para_thingspeak("NÃO")
 
-    if ult_an["compensa_limpar"]:
-        perda = ult_an["perda_percentual"]
-        perda_diaria = ult_an["perda_financeira"] * 48
-        st.error(f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!")
-
-    # Info box
     st.info(f"Calculando para uma placa de {potencia_cliente:.0f}W — Geração máxima esperada: {potencia_cliente * EFICIENCIA:.1f}W em condições ideais")
 
-    # Diagnóstico atual
     st.subheader("Diagnóstico Atual")
     cls = "alert" if ult_an["compensa_limpar"] else ("warn" if ult_an["indicativo_sujeira"] else "ok")
     st.markdown(f'<div class="decision-box {cls}">{ult_an["mensagem_status"]}</div>', unsafe_allow_html=True)
 
-    # Indicadores em tempo real
     st.subheader("Indicadores em Tempo Real")
     c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
+    with c1: 
         card("Irradiância", f"{ultima.get('irradiancia', 0):.0f}", "W/m²", "#facc15")
-    with c2:
+    with c2: 
         card("Geração Prevista", f"{ult_an['geracao_prevista']:.1f}", "W", "#60a5fa")
-    with c3:
+    with c3: 
         card("Geração Real", f"{ult_an['geracao_real']:.1f}", "W", "#f59e0b")
     with c4:
         cor = "#ef4444" if ult_an["perda_percentual"] > LIMIAR_SUJEIRA else "#22c55e"
         card("Perda Estimada", f"{ult_an['perda_percentual']:.1f}", "%", cor)
-    with c5:
+    with c5: 
         card("Temperatura", f"{ultima.get('temp_ambiente', 0):.1f}", "°C", "#34d399")
 
     c6, c7, c8, c9, c10 = st.columns(5)
-    with c6:
+    with c6: 
         card("Nuvens", f"{ultima.get('nuvens_pct', 0):.0f}", "%", "#94a3b8")
-    with c7:
+    with c7: 
         card("Perda/Medição", f"R$ {ult_an['perda_financeira']:.4f}", "", "#f87171")
-    with c8:
+    with c8: 
         card("Perda Diária", f"R$ {ult_an['perda_financeira']*48:.2f}", "estimada", "#fb923c")
-    with c9:
+    with c9: 
         card("Custo Limpeza", f"R$ {CUSTO_LIMPEZA:.2f}", "", "#a78bfa")
-    with c10:
+    with c10: 
         card("Registros", f"{len(df)}", "no período", "#67e8f9")
 
     st.markdown("---")
 
-    # Gráfico: Geração Prevista vs Real
     st.subheader("Geração Prevista vs Real")
     fig1 = go.Figure()
     fig1.add_trace(go.Scatter(
@@ -347,7 +389,7 @@ def main():
     st.plotly_chart(fig1, use_container_width=True)
 
     ca, cb = st.columns(2)
-
+    
     with ca:
         st.subheader("Irradiância Solar")
         fig2 = go.Figure(go.Scatter(
@@ -357,7 +399,7 @@ def main():
         ))
         fig2.update_layout(**LAY, title="Irradiância (W/m²)", yaxis_title="W/m²")
         st.plotly_chart(fig2, use_container_width=True)
-
+    
     with cb:
         st.subheader("Temperatura e Nuvens")
         fig3 = go.Figure()
@@ -372,16 +414,13 @@ def main():
                 name="Nuvens (%)", opacity=0.4,
                 marker_color="#94a3b8", yaxis="y2"
             ))
-        # FIX: monta o layout num dicionário único ao invés de passar
-        # yaxis/yaxis2 junto com **LAY (que já tem "yaxis"), o que causava
-        # "got multiple values for keyword argument 'yaxis'"
-        layout_temp = {**LAY, "title": "Temperatura e Nuvens"}
-        layout_temp["yaxis"] = dict(title="°C", gridcolor="#1e293b", linecolor="#334155")
-        layout_temp["yaxis2"] = dict(title="%", overlaying="y", side="right", gridcolor="#1e293b", linecolor="#334155")
-        fig3.update_layout(**layout_temp)
+        fig3.update_layout(
+            **LAY, title="Temperatura e Nuvens",
+            yaxis=dict(title="°C", gridcolor="#1e293b", linecolor="#334155"),
+            yaxis2=dict(title="%", overlaying="y", side="right", gridcolor="#1e293b", linecolor="#334155")
+        )
         st.plotly_chart(fig3, use_container_width=True)
 
-    # Gráfico: Perda por Sujeira
     st.subheader("Perda Estimada por Sujeira")
     fig4 = go.Figure(go.Bar(
         x=df["timestamp"], y=an["perda_percentual"],
@@ -397,31 +436,25 @@ def main():
 
     st.markdown("---")
 
-    # Análise econômica
     st.subheader("Análise Econômica do Período")
     perda_kwh = ((an["geracao_prevista"] - an["geracao_real"]) * 0.25 / 1000).sum()
     perda_r = an["perda_financeira"].sum()
     e1, e2, e3, e4 = st.columns(4)
-    with e1:
+    with e1: 
         card("Energia Perdida", f"{perda_kwh:.4f}", "kWh")
-    with e2:
+    with e2: 
         card("Perda Total", f"R$ {perda_r:.3f}", "no período")
-    with e3:
+    with e3: 
         card("Alertas Sujeira", f"{int(an['indicativo_sujeira'].sum())}", "leituras")
-    with e4:
+    with e4: 
         card("Limpezas Recom.", f"{int(an['compensa_limpar'].sum())}", "ocorrências")
 
     st.markdown("---")
 
-    # Tabela de dados
     with st.expander("📋 Ver dados da planilha"):
         st.dataframe(df.sort_values("timestamp", ascending=False), use_container_width=True)
 
-    st.caption("TCC Solar | Python + Streamlit + Google Sheets")
-
-# ============================================================================
-# 🚀 EXECUTAR
-# ============================================================================
+    st.caption("TCC Solar | Python + Streamlit + Google Sheets + Thingspeak + ESP32")
 
 if __name__ == "__main__":
     main()
