@@ -1,0 +1,48 @@
+{
+  "name": "TCC Solar - Detecção de Sujeira em Placas Fotovoltaicas",
+  "short_name": "TCC Solar",
+  "description": "Dashboard de monitoramento de sujeira em placas fotovoltaicas com IA",
+  "start_url": "https://tcc-solar-guiaizza.streamlit.app",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "theme_color": "#FFA500",
+  "background_color": "#FFFFFF",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
+      "sizes": "540x720",
+      "type": "image/png"
+    }
+  ],
+  "categories": ["utilities", "productivity"],
+  "shortcuts": [
+    {
+      "name": "Abrir Dashboard",
+      "short_name": "Dashboard",
+      "description": "Abre o dashboard de monitoramento",
+      "url": "https://tcc-solar-guiaizza.streamlit.app",
+      "icons": [
+        {
+          "src": "https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/app/icon.png",
+          "sizes": "192x192",
+          "type": "image/png"
+        }
+      ]
+    }
+  ]
+}
