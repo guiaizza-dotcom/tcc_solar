@@ -120,7 +120,7 @@ def carregar_sheets():
                 rename[col] = "geracao_estimada"
             elif "perda" in cl and "percentual" in cl:
                 rename[col] = "perda_percentual"
-            elif "compensa" in cl or "limpar" in cl.lower():
+           elif "compensa" in cl.lower() and "limpar" in cl.lower():
                 rename[col] = "compensa_limpar_texto"
         
         df = df.rename(columns=rename)
