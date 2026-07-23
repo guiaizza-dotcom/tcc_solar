@@ -266,6 +266,15 @@ def card(titulo, valor, unidade="", cor="#f1f5f9"):
 # 📊 CONFIGURAÇÕES DE LAYOUT DOS GRÁFICOS
 # ============================================================================
 
+def hex_para_rgba(hex_color, alpha=0.15):
+    """Converte '#RRGGBB' em 'rgba(r,g,b,alpha)' — formato aceito por todas as versões do Plotly
+    (o formato antigo '#RRGGBB' + hex de transparência, ex: '#f59e0b26', passou a ser rejeitado)."""
+    hex_color = hex_color.lstrip("#")
+    r = int(hex_color[0:2], 16)
+    g = int(hex_color[2:4], 16)
+    b = int(hex_color[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
 LAY = dict(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
@@ -458,7 +467,7 @@ def render_placa_ao_vivo():
             with col:
                 fig = go.Figure(go.Scatter(
                     x=df_ts["timestamp"], y=df_ts[campo],
-                    fill="tozeroy", fillcolor=info["cor"] + "26",
+                    fill="tozeroy", fillcolor=hex_para_rgba(info["cor"], 0.15),
                     line=dict(color=info["cor"], width=2), name=info["nome"]
                 ))
                 fig.update_layout(**LAY, title=f"{info['nome']} ({info['unidade']})", yaxis_title=info["unidade"])
