@@ -2,6 +2,9 @@
 # 🌞 TCC SOLAR - DETECÇÃO DE SUJEIRA EM PLACAS FOTOVOLTAICAS
 # ============================================================================
 
+import re
+import smtplib
+from email.mime.text import MIMEText
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -53,6 +56,7 @@ IRRADIANCIA_STC = 1000.0
 TARIFA_KWH = 0.75
 CUSTO_LIMPEZA = 5.00
 LIMIAR_SUJEIRA = 10.0
+EMAIL_ALERTA_PADRAO = "bittoleoguio@gmail.com"  # usado só se a planilha ainda não tiver e-mail salvo
 
 # --- ThingSpeak (Minha Placa ao Vivo) ---
 THINGSPEAK_CHANNEL_ID = "3337625"
@@ -98,6 +102,42 @@ def gravar_potencia(potencia):
     except Exception as e:
         st.error(f"Erro ao gravar na planilha: {e}")
         return False
+
+def gravar_email_alerta(email):
+    """Grava o e-mail de alerta na planilha do Google Sheets (célula I2), para persistir entre sessões."""
+    try:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        if "gcp_service_account" in st.secrets:
+            creds = Credentials.from_service_account_info(
+                dict(st.secrets["gcp_service_account"]), scopes=scopes)
+        else:
+            creds = Credentials.from_service_account_file(CRED_FILE, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SHEET_ID)
+        ws = sh.sheet1
+        ws.update("I2", [[email]])
+        return True
+    except Exception as e:
+        st.error(f"Erro ao gravar e-mail na planilha: {e}")
+        return False
+
+@st.cache_data(ttl=30)
+def carregar_email_alerta():
+    """Lê o e-mail de alerta salvo na planilha (célula I2). Retorna string vazia se não houver."""
+    try:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        if "gcp_service_account" in st.secrets:
+            creds = Credentials.from_service_account_info(
+                dict(st.secrets["gcp_service_account"]), scopes=scopes)
+        else:
+            creds = Credentials.from_service_account_file(CRED_FILE, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SHEET_ID)
+        ws = sh.sheet1
+        valor = ws.acell("I2").value
+        return valor.strip() if valor else EMAIL_ALERTA_PADRAO
+    except Exception:
+        return ""
 
 @st.cache_data(ttl=60)
 def carregar_sheets():
@@ -250,6 +290,109 @@ def mostrar_botao_teste_notificacao():
         st.info("📢 TESTE: LIMPEZA NECESSÁRIA!\n\nEsta é uma notificação de teste! Perda: 25.5%. Perda diária: R$12.50. COMPENSA LIMPAR!")
 
 # ============================================================================
+# 📧 ABA: NOTIFICAÇÃO AUTOMÁTICA POR E-MAIL (Gmail SMTP)
+# ============================================================================
+# Como funciona (gratuito, usando a SUA própria conta Gmail — configurada 1x por você,
+# o cliente final não precisa fazer nenhum cadastro, só digitar o e-mail dele):
+# 1. Ative a verificação em 2 etapas na sua Conta Google (necessário p/ o próximo passo).
+# 2. Crie uma "Senha de app" em: https://myaccount.google.com/apppasswords
+#    (escolha "outro" e dê um nome, ex: "TCC Solar"). Você recebe uma senha de 16 letras.
+# 3. Salve essas credenciais no arquivo .streamlit/secrets.toml do projeto:
+#      gmail_remetente = "seuemail@gmail.com"
+#      gmail_senha_app = "xxxxxxxxxxxxxxxx"
+#    Assim o cliente final NUNCA vê nem precisa saber dessas credenciais — ele só
+#    digita o próprio e-mail no campo da aba e pronto, os alertas chegam sozinhos.
+
+def email_valido(email: str) -> bool:
+    """Validação simples de formato de e-mail."""
+    return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email) is not None
+
+def enviar_email_gmail(remetente: str, senha_app: str, destinatario: str, assunto: str, mensagem: str):
+    """Envia e-mail via Gmail SMTP. Retorna (sucesso: bool, detalhe: str)."""
+    try:
+        msg = MIMEText(mensagem)
+        msg["Subject"] = assunto
+        msg["From"] = remetente
+        msg["To"] = destinatario
+
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as servidor:
+            servidor.starttls()
+            servidor.login(remetente, senha_app)
+            servidor.sendmail(remetente, [destinatario], msg.as_string())
+        return True, "OK"
+    except smtplib.SMTPAuthenticationError:
+        return False, "Falha de autenticação — confira o e-mail e a Senha de app do Gmail (configurados em secrets.toml)."
+    except Exception as e:
+        return False, f"Falha ao enviar: {e}"
+
+def render_aba_email():
+    """
+    Aba onde o cliente final só digita o e-mail dele (sem nenhum cadastro).
+    O e-mail é salvo na planilha do Google Sheets (persiste entre sessões e
+    reinicializações do app). A partir daí, o app envia automaticamente um
+    alerta por e-mail sempre que detectar que compensa limpar a placa.
+    """
+    st.subheader("📧 Alertas por e-mail")
+    st.caption(
+        "Digite seu e-mail abaixo. Sempre que o sistema detectar que a limpeza da "
+        "placa compensa financeiramente, você recebe um alerta automático — não é "
+        "preciso nenhum cadastro."
+    )
+
+    if "email_alerta" not in st.session_state:
+        st.session_state["email_alerta"] = carregar_email_alerta()
+    if "ultimo_alerta_enviado" not in st.session_state:
+        st.session_state["ultimo_alerta_enviado"] = False
+
+    email_cliente = st.text_input(
+        "Seu e-mail",
+        value=st.session_state["email_alerta"],
+        placeholder="seuemail@exemplo.com",
+    )
+
+    if email_cliente and not email_valido(email_cliente):
+        st.error("Informe um e-mail válido.")
+    elif email_cliente and email_cliente != st.session_state["email_alerta"]:
+        st.session_state["email_alerta"] = email_cliente
+        if gravar_email_alerta(email_cliente):
+            st.cache_data.clear()
+            st.success("E-mail salvo! Você receberá um alerta automático quando compensar limpar a placa.")
+    elif email_cliente:
+        st.success("E-mail salvo. Você receberá um alerta automático quando compensar limpar a placa.")
+
+def verificar_e_enviar_alerta_email(compensa_limpar: bool, mensagem_alerta: str):
+    """
+    Chamada a cada carregamento da página: se 'compensa_limpar' for True e houver um
+    e-mail salvo na sessão, envia o alerta automaticamente (uma vez só por ocorrência,
+    evitando reenviar a cada atualização da página).
+    """
+    email_cliente = st.session_state.get("email_alerta", "")
+    if not email_cliente:
+        email_cliente = carregar_email_alerta()
+        st.session_state["email_alerta"] = email_cliente
+    if not email_cliente or not email_valido(email_cliente):
+        return
+
+    remetente = st.secrets.get("gmail_remetente", "") if hasattr(st, "secrets") else ""
+    senha_app = st.secrets.get("gmail_senha_app", "") if hasattr(st, "secrets") else ""
+    if not remetente or not senha_app:
+        return  # credenciais não configuradas em secrets.toml — nada a fazer
+
+    if compensa_limpar and not st.session_state.get("ultimo_alerta_enviado", False):
+        sucesso, _ = enviar_email_gmail(
+            remetente, senha_app, email_cliente,
+            "TCC Solar - Limpeza da placa recomendada",
+            mensagem_alerta,
+        )
+        st.session_state["ultimo_alerta_enviado"] = True
+        if sucesso:
+            st.toast("📧 Alerta enviado por e-mail!")
+    elif not compensa_limpar:
+        # Reseta a trava assim que a placa deixa de precisar de limpeza,
+        # para que um novo alerta seja disparado na próxima vez que voltar a compensar.
+        st.session_state["ultimo_alerta_enviado"] = False
+
+# ============================================================================
 # ☀️ ABA: MINHA PLACA AO VIVO (ThingSpeak)
 # ============================================================================
 
@@ -378,10 +521,13 @@ def main():
     # 🧪 BOTÃO DE TESTE DE NOTIFICAÇÃO
     mostrar_botao_teste_notificacao()
 
-    tab1, tab2 = st.tabs(["📊 Dashboard", "☀️ Minha Placa ao Vivo"])
+    tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "☀️ Minha Placa ao Vivo", "📧 E-mail"])
 
     with tab2:
         render_placa_ao_vivo()
+
+    with tab3:
+        render_aba_email()
 
     with tab1:
         # Verificar se há dados
@@ -409,7 +555,11 @@ def main():
         if ult_an["compensa_limpar"]:
             perda = ult_an["perda_percentual"]
             perda_diaria = ult_an["perda_financeira"] * 48
-            st.error(f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!")
+            msg_alerta = f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!"
+            st.error(msg_alerta)
+            verificar_e_enviar_alerta_email(True, msg_alerta)
+        else:
+            verificar_e_enviar_alerta_email(False, "")
 
         # Info box
         st.info(f"Calculando para uma placa de {potencia_cliente:.0f}W — Geração máxima esperada: {potencia_cliente * EFICIENCIA:.1f}W em condições ideais")
