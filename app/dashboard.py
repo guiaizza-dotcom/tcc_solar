@@ -56,12 +56,13 @@ IRRADIANCIA_STC = 1000.0
 TARIFA_KWH = 0.75
 CUSTO_LIMPEZA = 5.00
 LIMIAR_SUJEIRA = 10.0
-EMAIL_ALERTA_PADRAO = "bittoleoguio@gmail.com"  # usado só se a planilha ainda não tiver e-mail salvo
+EMAIL_ALERTA_PADRAO = "bittoleoguio@gmail.com"
 
 # --- ThingSpeak (Minha Placa ao Vivo) ---
 THINGSPEAK_CHANNEL_ID = "3337625"
 THINGSPEAK_READ_API_KEY = "I7LHJFAFLIN4J5HJ"
-THINGSPEAK_FIELD_IRRADIANCIA = 7  # Field 7 = Irradiação
+THINGSPEAK_WRITE_API_KEY = "YOUR_API_KEY"  # ← PREENCHER COM A CHAVE DO SEU AMIGO
+THINGSPEAK_FIELD_COMANDO = 1  # Field 1 = Comando Limpeza
 
 # ============================================================================
 # 🎨 ESTILOS CSS
@@ -104,7 +105,7 @@ def gravar_potencia(potencia):
         return False
 
 def gravar_email_alerta(email):
-    """Grava o e-mail de alerta na planilha do Google Sheets (célula I2), para persistir entre sessões."""
+    """Grava o e-mail de alerta na planilha do Google Sheets (célula I2)"""
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         if "gcp_service_account" in st.secrets:
@@ -123,7 +124,7 @@ def gravar_email_alerta(email):
 
 @st.cache_data(ttl=30)
 def carregar_email_alerta():
-    """Lê o e-mail de alerta salvo na planilha (célula I2). Retorna string vazia se não houver."""
+    """Lê o e-mail de alerta salvo na planilha (célula I2)"""
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         if "gcp_service_account" in st.secrets:
@@ -160,6 +161,8 @@ def carregar_sheets():
                 rename[col] = "irradiancia"
             elif "gera" in cl or "estimad" in cl:
                 rename[col] = "geracao_estimada"
+            elif "comando" in cl and "limpeza" in cl:
+                rename[col] = "comando_limpeza"
 
         df = df.rename(columns=rename)
 
@@ -178,7 +181,7 @@ def carregar_sheets():
         st.error(f"Erro ao carregar planilha: {e}")
         return pd.DataFrame()
 
-# Nomes amigáveis de cada field do canal (conforme Channel Settings do ThingSpeak)
+# Nomes amigáveis de cada field do canal ThingSpeak
 THINGSPEAK_CAMPOS = {
     "field1": {"nome": "Potência Placa Suja", "unidade": "W", "cor": "#f59e0b"},
     "field2": {"nome": "Tensão Placa Suja", "unidade": "V", "cor": "#60a5fa"},
@@ -192,7 +195,7 @@ THINGSPEAK_CAMPOS = {
 
 @st.cache_data(ttl=15)
 def buscar_dados_thingspeak(n_resultados=30):
-    """Busca as últimas leituras de TODOS os fields do canal ThingSpeak (canal privado)"""
+    """Busca as últimas leituras do ThingSpeak"""
     url = f"https://api.thingspeak.com/channels/{THINGSPEAK_CHANNEL_ID}/feeds.json"
     params = {"api_key": THINGSPEAK_READ_API_KEY, "results": n_resultados}
     try:
@@ -216,6 +219,20 @@ def buscar_dados_thingspeak(n_resultados=30):
         st.error(f"Erro ao buscar dados do ThingSpeak: {e}")
         return pd.DataFrame()
 
+def enviar_para_thingspeak(comando):
+    """Envia comando para Thingspeak (SIM ou NÃO)"""
+    try:
+        url = "https://api.thingspeak.com/update"
+        params = {
+            "api_key": THINGSPEAK_WRITE_API_KEY,
+            "field1": comando  # "SIM" ou "NÃO"
+        }
+        response = requests.get(url, params=params)
+        return response.status_code == 200
+    except Exception as e:
+        st.warning(f"Erro ao enviar para Thingspeak: {e}")
+        return False
+
 def analisar(df, potencia_w):
     """Analisa os dados e calcula se compensa limpar"""
     rows = []
@@ -225,16 +242,13 @@ def analisar(df, potencia_w):
         ger_prev = ger_est
         ger_real = round((irrad / IRRADIANCIA_STC) * potencia_w * EFICIENCIA, 3)
 
-        # Calcular perda percentual
         perda = max(0, round((ger_prev - ger_real) / ger_prev * 100, 2) if ger_prev > 0 else 0)
         ind = perda > LIMIAR_SUJEIRA
 
-        # Perda financeira
         p_fin = round((ger_prev - ger_real) * 0.25 / 1000 * TARIFA_KWH, 4)
         p_dia = p_fin * 48
         comp = ind and (p_dia > CUSTO_LIMPEZA)
 
-        # Mensagem de status
         if not ind:
             msg = "✅ Placa OK. Limpeza não necessária."
         elif comp:
@@ -267,8 +281,7 @@ def card(titulo, valor, unidade="", cor="#f1f5f9"):
 # ============================================================================
 
 def hex_para_rgba(hex_color, alpha=0.15):
-    """Converte '#RRGGBB' em 'rgba(r,g,b,alpha)' — formato aceito por todas as versões do Plotly
-    (o formato antigo '#RRGGBB' + hex de transparência, ex: '#f59e0b26', passou a ser rejeitado)."""
+    """Converte '#RRGGBB' em 'rgba(r,g,b,alpha)'"""
     hex_color = hex_color.lstrip("#")
     r = int(hex_color[0:2], 16)
     g = int(hex_color[2:4], 16)
@@ -287,7 +300,7 @@ LAY = dict(
 )
 
 # ============================================================================
-# 🧪 TESTE DE NOTIFICAÇÃO (usando Streamlit, sem JavaScript)
+# 🧪 TESTE DE NOTIFICAÇÃO
 # ============================================================================
 
 def mostrar_botao_teste_notificacao():
@@ -296,28 +309,18 @@ def mostrar_botao_teste_notificacao():
     st.sidebar.subheader("🧪 Teste")
     if st.sidebar.button("📢 Testar Notificação", use_container_width=True):
         st.success("✅ NOTIFICAÇÃO DE TESTE DISPARADA!")
-        st.info("📢 TESTE: LIMPEZA NECESSÁRIA!\n\nEsta é uma notificação de teste! Perda: 25.5%. Perda diária: R$12.50. COMPENSA LIMPAR!")
+        st.info("📢 TESTE: LIMPEZA NECESSÁRIA!\n\nEsta é uma notificação de teste!")
 
 # ============================================================================
-# 📧 ABA: NOTIFICAÇÃO AUTOMÁTICA POR E-MAIL (Gmail SMTP)
+# 📧 E-MAIL
 # ============================================================================
-# Como funciona (gratuito, usando a SUA própria conta Gmail — configurada 1x por você,
-# o cliente final não precisa fazer nenhum cadastro, só digitar o e-mail dele):
-# 1. Ative a verificação em 2 etapas na sua Conta Google (necessário p/ o próximo passo).
-# 2. Crie uma "Senha de app" em: https://myaccount.google.com/apppasswords
-#    (escolha "outro" e dê um nome, ex: "TCC Solar"). Você recebe uma senha de 16 letras.
-# 3. Salve essas credenciais no arquivo .streamlit/secrets.toml do projeto:
-#      gmail_remetente = "seuemail@gmail.com"
-#      gmail_senha_app = "xxxxxxxxxxxxxxxx"
-#    Assim o cliente final NUNCA vê nem precisa saber dessas credenciais — ele só
-#    digita o próprio e-mail no campo da aba e pronto, os alertas chegam sozinhos.
 
 def email_valido(email: str) -> bool:
-    """Validação simples de formato de e-mail."""
+    """Validação de e-mail"""
     return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email) is not None
 
 def enviar_email_gmail(remetente: str, senha_app: str, destinatario: str, assunto: str, mensagem: str):
-    """Envia e-mail via Gmail SMTP. Retorna (sucesso: bool, detalhe: str)."""
+    """Envia e-mail via Gmail SMTP"""
     try:
         msg = MIMEText(mensagem)
         msg["Subject"] = assunto
@@ -330,23 +333,14 @@ def enviar_email_gmail(remetente: str, senha_app: str, destinatario: str, assunt
             servidor.sendmail(remetente, [destinatario], msg.as_string())
         return True, "OK"
     except smtplib.SMTPAuthenticationError:
-        return False, "Falha de autenticação — confira o e-mail e a Senha de app do Gmail (configurados em secrets.toml)."
+        return False, "Falha de autenticação — confira o e-mail e a Senha de app do Gmail."
     except Exception as e:
         return False, f"Falha ao enviar: {e}"
 
 def render_aba_email():
-    """
-    Aba onde o cliente final só digita o e-mail dele (sem nenhum cadastro).
-    O e-mail é salvo na planilha do Google Sheets (persiste entre sessões e
-    reinicializações do app). A partir daí, o app envia automaticamente um
-    alerta por e-mail sempre que detectar que compensa limpar a placa.
-    """
+    """Aba de alertas por e-mail"""
     st.subheader("📧 Alertas por e-mail")
-    st.caption(
-        "Digite seu e-mail abaixo. Sempre que o sistema detectar que a limpeza da "
-        "placa compensa financeiramente, você recebe um alerta automático — não é "
-        "preciso nenhum cadastro."
-    )
+    st.caption("Digite seu e-mail abaixo. Você receberá um alerta automático quando a limpeza compensar financeiramente.")
 
     if "email_alerta" not in st.session_state:
         st.session_state["email_alerta"] = carregar_email_alerta()
@@ -365,16 +359,12 @@ def render_aba_email():
         st.session_state["email_alerta"] = email_cliente
         if gravar_email_alerta(email_cliente):
             st.cache_data.clear()
-            st.success("E-mail salvo! Você receberá um alerta automático quando compensar limpar a placa.")
+            st.success("E-mail salvo! Você receberá um alerta automático.")
     elif email_cliente:
-        st.success("E-mail salvo. Você receberá um alerta automático quando compensar limpar a placa.")
+        st.success("E-mail salvo. Você receberá um alerta automático.")
 
 def verificar_e_enviar_alerta_email(compensa_limpar: bool, mensagem_alerta: str):
-    """
-    Chamada a cada carregamento da página: se 'compensa_limpar' for True e houver um
-    e-mail salvo na sessão, envia o alerta automaticamente (uma vez só por ocorrência,
-    evitando reenviar a cada atualização da página).
-    """
+    """Envia e-mail de alerta se necessário"""
     email_cliente = st.session_state.get("email_alerta", "")
     if not email_cliente:
         email_cliente = carregar_email_alerta()
@@ -385,7 +375,7 @@ def verificar_e_enviar_alerta_email(compensa_limpar: bool, mensagem_alerta: str)
     remetente = st.secrets.get("gmail_remetente", "") if hasattr(st, "secrets") else ""
     senha_app = st.secrets.get("gmail_senha_app", "") if hasattr(st, "secrets") else ""
     if not remetente or not senha_app:
-        return  # credenciais não configuradas em secrets.toml — nada a fazer
+        return
 
     if compensa_limpar and not st.session_state.get("ultimo_alerta_enviado", False):
         sucesso, _ = enviar_email_gmail(
@@ -397,8 +387,6 @@ def verificar_e_enviar_alerta_email(compensa_limpar: bool, mensagem_alerta: str)
         if sucesso:
             st.toast("📧 Alerta enviado por e-mail!")
     elif not compensa_limpar:
-        # Reseta a trava assim que a placa deixa de precisar de limpeza,
-        # para que um novo alerta seja disparado na próxima vez que voltar a compensar.
         st.session_state["ultimo_alerta_enviado"] = False
 
 # ============================================================================
@@ -406,7 +394,7 @@ def verificar_e_enviar_alerta_email(compensa_limpar: bool, mensagem_alerta: str)
 # ============================================================================
 
 def render_placa_ao_vivo():
-    """Aba que mostra dados ao vivo vindos do ThingSpeak (todos os 8 fields do canal)"""
+    """Aba que mostra dados ao vivo do ThingSpeak"""
     st.subheader("☀️ Minha Placa ao Vivo — ThingSpeak")
 
     if st.button("🔄 Atualizar agora", key="btn_atualizar_thingspeak"):
@@ -422,7 +410,6 @@ def render_placa_ao_vivo():
     ultima = df_ts.iloc[-1]
     st.caption(f"Última leitura: {ultima['timestamp'].strftime('%d/%m/%Y %H:%M:%S')}")
 
-    # Cards com o valor mais recente de cada field
     st.subheader("Valores Atuais")
     campos = list(THINGSPEAK_CAMPOS.items())
     linha1, linha2 = campos[:4], campos[4:]
@@ -443,7 +430,6 @@ def render_placa_ao_vivo():
 
     st.markdown("---")
 
-    # Gráfico comparativo: Placa Suja vs Placa Limpa (potência)
     st.subheader("Potência: Placa Suja vs Placa Limpa")
     fig_pot = go.Figure()
     fig_pot.add_trace(go.Scatter(
@@ -457,7 +443,6 @@ def render_placa_ao_vivo():
     fig_pot.update_layout(**LAY, title="Potência (W)", yaxis_title="W")
     st.plotly_chart(fig_pot, use_container_width=True)
 
-    # Um gráfico de histórico para cada field, dois por linha
     st.subheader("Histórico por Sensor")
     itens = list(THINGSPEAK_CAMPOS.items())
     for i in range(0, len(itens), 2):
@@ -481,15 +466,12 @@ def render_placa_ao_vivo():
 # ============================================================================
 
 def main():
-    # Cabeçalho
     st.markdown('<h1 style="margin:0">☀️ Monitor de Placas Fotovoltaicas</h1>', unsafe_allow_html=True)
-    st.markdown("**Sistema inteligente de detecção de sujeira e análise de viabilidade econômica**")
+    st.markdown("*Sistema inteligente de detecção de sujeira e análise de viabilidade econômica*")
     st.markdown("---")
 
-    # Carregar dados
     df = carregar_sheets()
 
-    # Sidebar
     with st.sidebar:
         st.title("⚙️ Configurações")
         st.markdown("---")
@@ -509,7 +491,6 @@ def main():
 
         st.markdown("---")
 
-        # Filtro de período
         if not df.empty and "timestamp" in df.columns:
             st.subheader("📅 Período")
             dmin = df["timestamp"].min().date()
@@ -518,7 +499,7 @@ def main():
             d2 = st.date_input("Até:", value=dmax, min_value=dmin, max_value=dmax)
 
         st.markdown("---")
-        st.markdown("**TCC Solar**\n- Dados via API climática\n- Python + Streamlit")
+        st.markdown("*TCC Solar*\n- Dados via API climática\n- Python + Streamlit")
         st.markdown("---")
 
         if st.button("🔄 Atualizar dados", use_container_width=True):
@@ -527,7 +508,6 @@ def main():
 
         st.caption(f"Atualizado: {datetime.now().strftime('%H:%M:%S')}")
 
-    # 🧪 BOTÃO DE TESTE DE NOTIFICAÇÃO
     mostrar_botao_teste_notificacao()
 
     tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "☀️ Minha Placa ao Vivo", "📧 E-mail"])
@@ -539,12 +519,10 @@ def main():
         render_aba_email()
 
     with tab1:
-        # Verificar se há dados
         if df.empty:
             st.warning("⚠️ Sem dados da planilha.")
             st.stop()
 
-        # Filtrar por período
         mask = (df["timestamp"].dt.date >= d1) & (df["timestamp"].dt.date <= d2)
         df = df[mask].copy()
 
@@ -552,33 +530,78 @@ def main():
             st.warning("Nenhum dado para o período selecionado.")
             st.stop()
 
-        # Análise
         an = analisar(df, potencia_cliente)
         ultima = df.iloc[-1]
         ult_an = an.iloc[-1]
 
         # ============================================================================
-        # 🔔 VERIFICAR SE COMPENSA LIMPAR E MOSTRAR NOTIFICAÇÃO
+        # 🔔 LER COLUNA I (COMANDO LIMPEZA) E ENVIAR PARA THINGSPEAK
         # ============================================================================
+        
+        try:
+            comando_col = None
+            for col in df.columns:
+                if "comando" in col.lower() and "limpeza" in col.lower():
+                    comando_col = col
+                    break
+            
+            if comando_col and not df.empty:
+                ultimo_comando = str(df.iloc[-1].get(comando_col, "")).upper().strip()
+                
+                if ultimo_comando == "SIM":
+                    perda = ult_an["perda_percentual"]
+                    perda_diaria = ult_an["perda_financeira"] * 48
+                    msg_alerta = f"🚨 LIMPEZA NECESSÁRIA!\n\n*Comando Manual Ativado*\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!"
+                    st.error(msg_alerta)
+                    enviar_para_thingspeak("SIM")
+                    verificar_e_enviar_alerta_email(True, msg_alerta)
+                elif ultimo_comando == "NÃO":
+                    st.success("✅ Placa OK. Limpeza não necessária.")
+                    enviar_para_thingspeak("NÃO")
+                    verificar_e_enviar_alerta_email(False, "")
+                else:
+                    if ult_an["compensa_limpar"]:
+                        perda = ult_an["perda_percentual"]
+                        perda_diaria = ult_an["perda_financeira"] * 48
+                        msg_alerta = f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!"
+                        st.error(msg_alerta)
+                        enviar_para_thingspeak("SIM")
+                        verificar_e_enviar_alerta_email(True, msg_alerta)
+                    else:
+                        st.success("✅ Placa OK. Limpeza não necessária.")
+                        enviar_para_thingspeak("NÃO")
+                        verificar_e_enviar_alerta_email(False, "")
+            else:
+                if ult_an["compensa_limpar"]:
+                    perda = ult_an["perda_percentual"]
+                    perda_diaria = ult_an["perda_financeira"] * 48
+                    msg_alerta = f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!"
+                    st.error(msg_alerta)
+                    enviar_para_thingspeak("SIM")
+                    verificar_e_enviar_alerta_email(True, msg_alerta)
+                else:
+                    st.success("✅ Placa OK. Limpeza não necessária.")
+                    enviar_para_thingspeak("NÃO")
+                    verificar_e_enviar_alerta_email(False, "")
+        except Exception as e:
+            if ult_an["compensa_limpar"]:
+                perda = ult_an["perda_percentual"]
+                perda_diaria = ult_an["perda_financeira"] * 48
+                msg_alerta = f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!"
+                st.error(msg_alerta)
+                enviar_para_thingspeak("SIM")
+                verificar_e_enviar_alerta_email(True, msg_alerta)
+            else:
+                st.success("✅ Placa OK. Limpeza não necessária.")
+                enviar_para_thingspeak("NÃO")
+                verificar_e_enviar_alerta_email(False, "")
 
-        if ult_an["compensa_limpar"]:
-            perda = ult_an["perda_percentual"]
-            perda_diaria = ult_an["perda_financeira"] * 48
-            msg_alerta = f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!"
-            st.error(msg_alerta)
-            verificar_e_enviar_alerta_email(True, msg_alerta)
-        else:
-            verificar_e_enviar_alerta_email(False, "")
-
-        # Info box
         st.info(f"Calculando para uma placa de {potencia_cliente:.0f}W — Geração máxima esperada: {potencia_cliente * EFICIENCIA:.1f}W em condições ideais")
 
-        # Diagnóstico atual
         st.subheader("Diagnóstico Atual")
         cls = "alert" if ult_an["compensa_limpar"] else ("warn" if ult_an["indicativo_sujeira"] else "ok")
         st.markdown(f'<div class="decision-box {cls}">{ult_an["mensagem_status"]}</div>', unsafe_allow_html=True)
 
-        # Indicadores em tempo real
         st.subheader("Indicadores em Tempo Real")
         c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
@@ -607,7 +630,6 @@ def main():
 
         st.markdown("---")
 
-        # Gráfico: Geração Prevista vs Real
         st.subheader("Geração Prevista vs Real")
         fig1 = go.Figure()
         fig1.add_trace(go.Scatter(
@@ -656,16 +678,12 @@ def main():
                     name="Nuvens (%)", opacity=0.4,
                     marker_color="#94a3b8", yaxis="y2"
                 ))
-            # FIX: monta o layout num dicionário único ao invés de passar
-            # yaxis/yaxis2 junto com **LAY (que já tem "yaxis"), o que causava
-            # "got multiple values for keyword argument 'yaxis'"
             layout_temp = {**LAY, "title": "Temperatura e Nuvens"}
             layout_temp["yaxis"] = dict(title="°C", gridcolor="#1e293b", linecolor="#334155")
             layout_temp["yaxis2"] = dict(title="%", overlaying="y", side="right", gridcolor="#1e293b", linecolor="#334155")
             fig3.update_layout(**layout_temp)
             st.plotly_chart(fig3, use_container_width=True)
 
-        # Gráfico: Perda por Sujeira
         st.subheader("Perda Estimada por Sujeira")
         fig4 = go.Figure(go.Bar(
             x=df["timestamp"], y=an["perda_percentual"],
@@ -681,7 +699,6 @@ def main():
 
         st.markdown("---")
 
-        # Análise econômica
         st.subheader("Análise Econômica do Período")
         perda_kwh = ((an["geracao_prevista"] - an["geracao_real"]) * 0.25 / 1000).sum()
         perda_r = an["perda_financeira"].sum()
@@ -697,16 +714,11 @@ def main():
 
         st.markdown("---")
 
-        # Tabela de dados
         with st.expander("📋 Ver dados da planilha"):
             st.dataframe(df.sort_values("timestamp", ascending=False), use_container_width=True)
 
-        st.caption("TCC Solar | Python + Streamlit + Google Sheets")
+        st.caption("TCC Solar | Python + Streamlit + Google Sheets + Thingspeak + Email")
 
 
-# ============================================================================
-# 🚀 EXECUTAR
-# ============================================================================
-
-if __name__ == "__main__":
+if _name_ == "_main_":
     main()
