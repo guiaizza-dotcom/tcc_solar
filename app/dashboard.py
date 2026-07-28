@@ -160,8 +160,6 @@ def carregar_sheets():
                 rename[col] = "irradiancia"
             elif "gera" in cl or "estimad" in cl:
                 rename[col] = "geracao_estimada"
-            elif "comando" in cl and "limpeza" in cl:
-                rename[col] = "comando_limpeza"
 
         df = df.rename(columns=rename)
 
@@ -371,15 +369,36 @@ def render_aba_email():
     elif email_cliente:
         st.success("E-mail salvo. Você receberá um alerta automático quando compensar limpar a placa.")
 
-def enviar_para_thingspeak(comando):
-    """Envia comando para Thingspeak (SIM ou NÃO)"""
-    try:
-        url = "https://api.thingspeak.com/update"
-        params = {"api_key": "YOUR_API_KEY", "field1": comando}
-        requests.get(url, params=params, timeout=5)
-        return True
-    except:
-        return False
+    st.markdown("---")
+    st.subheader("🧪 Diagnóstico e teste manual")
+
+    remetente = st.secrets.get("gmail_remetente", "") if hasattr(st, "secrets") else ""
+    senha_app = st.secrets.get("gmail_senha_app", "") if hasattr(st, "secrets") else ""
+
+    if remetente and senha_app:
+        st.success(f"Credenciais do Gmail encontradas nos Secrets (remetente: {remetente}).")
+    else:
+        st.error(
+            "❌ Não encontrei 'gmail_remetente' e/ou 'gmail_senha_app' nos Secrets do Streamlit Cloud. "
+            "Vá em Settings → Secrets do seu app e confira se estão salvos exatamente com esses nomes."
+        )
+
+    if st.button("📨 Enviar e-mail de teste agora", use_container_width=True):
+        if not email_cliente or not email_valido(email_cliente):
+            st.error("Digite um e-mail válido no campo acima antes de testar.")
+        elif not remetente or not senha_app:
+            st.error("Não é possível testar: credenciais do Gmail não configuradas nos Secrets.")
+        else:
+            with st.spinner("Enviando e-mail de teste..."):
+                sucesso, detalhe = enviar_email_gmail(
+                    remetente, senha_app, email_cliente,
+                    "TCC Solar - Teste de notificação",
+                    "Esta é uma mensagem de teste enviada manualmente pela aba de e-mail do TCC Solar.",
+                )
+            if sucesso:
+                st.success("✅ E-mail de teste enviado! Confira a caixa de entrada (e o Spam) em alguns segundos.")
+            else:
+                st.error(f"❌ Falha ao enviar: {detalhe}")
 
 def verificar_e_enviar_alerta_email(compensa_limpar: bool, mensagem_alerta: str):
     """
@@ -570,66 +589,17 @@ def main():
         ult_an = an.iloc[-1]
 
         # ============================================================================
-        # 🔔 VERIFICAR COMANDO LIMPEZA (COLUNA I) + THINGSPEAK
+        # 🔔 VERIFICAR SE COMPENSA LIMPAR E MOSTRAR NOTIFICAÇÃO
         # ============================================================================
 
-        try:
-            comando_col = None
-            for col in df.columns:
-                if "comando" in col.lower() and "limpeza" in col.lower():
-                    comando_col = col
-                    break
-
-            if comando_col and not df.empty:
-                ultimo_comando = str(df.iloc[-1].get(comando_col, "")).upper().strip()
-
-                if ultimo_comando == "SIM":
-                    perda = ult_an["perda_percentual"]
-                    perda_diaria = ult_an["perda_financeira"] * 48
-                    msg_alerta = f"🚨 LIMPEZA NECESSÁRIA!\n\n**Comando Manual Ativado**\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!"
-                    st.error(msg_alerta)
-                    enviar_para_thingspeak("SIM")
-                    verificar_e_enviar_alerta_email(True, msg_alerta)
-                elif ultimo_comando == "NÃO":
-                    st.success("✅ Placa OK. Limpeza não necessária.")
-                    enviar_para_thingspeak("NÃO")
-                    verificar_e_enviar_alerta_email(False, "")
-                else:
-                    if ult_an["compensa_limpar"]:
-                        perda = ult_an["perda_percentual"]
-                        perda_diaria = ult_an["perda_financeira"] * 48
-                        msg_alerta = f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!"
-                        st.error(msg_alerta)
-                        enviar_para_thingspeak("SIM")
-                        verificar_e_enviar_alerta_email(True, msg_alerta)
-                    else:
-                        st.success("✅ Placa OK. Limpeza não necessária.")
-                        enviar_para_thingspeak("NÃO")
-                        verificar_e_enviar_alerta_email(False, "")
-            else:
-                if ult_an["compensa_limpar"]:
-                    perda = ult_an["perda_percentual"]
-                    perda_diaria = ult_an["perda_financeira"] * 48
-                    msg_alerta = f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!"
-                    st.error(msg_alerta)
-                    enviar_para_thingspeak("SIM")
-                    verificar_e_enviar_alerta_email(True, msg_alerta)
-                else:
-                    st.success("✅ Placa OK. Limpeza não necessária.")
-                    enviar_para_thingspeak("NÃO")
-                    verificar_e_enviar_alerta_email(False, "")
-        except:
-            if ult_an["compensa_limpar"]:
-                perda = ult_an["perda_percentual"]
-                perda_diaria = ult_an["perda_financeira"] * 48
-                msg_alerta = f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!"
-                st.error(msg_alerta)
-                enviar_para_thingspeak("SIM")
-                verificar_e_enviar_alerta_email(True, msg_alerta)
-            else:
-                st.success("✅ Placa OK. Limpeza não necessária.")
-                enviar_para_thingspeak("NÃO")
-                verificar_e_enviar_alerta_email(False, "")
+        if ult_an["compensa_limpar"]:
+            perda = ult_an["perda_percentual"]
+            perda_diaria = ult_an["perda_financeira"] * 48
+            msg_alerta = f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!"
+            st.error(msg_alerta)
+            verificar_e_enviar_alerta_email(True, msg_alerta)
+        else:
+            verificar_e_enviar_alerta_email(False, "")
 
         # Info box
         st.info(f"Calculando para uma placa de {potencia_cliente:.0f}W — Geração máxima esperada: {potencia_cliente * EFICIENCIA:.1f}W em condições ideais")
