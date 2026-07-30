@@ -540,6 +540,13 @@ def render_placa_ao_vivo():
     if "ts_data_fim" not in st.session_state:
         st.session_state["ts_data_fim"] = hoje
 
+    def _definir_periodo_hoje():
+        # Roda ANTES da página recriar os widgets (callback do on_click), por isso
+        # pode alterar session_state de "ts_data_inicio"/"ts_data_fim" sem conflito.
+        d = agora_brasil().date()
+        st.session_state["ts_data_inicio"] = d
+        st.session_state["ts_data_fim"] = d
+
     col_p1, col_p2, col_p3, col_p4 = st.columns([1, 1, 1, 1])
     with col_p1:
         data_inicio = st.date_input("De:", key="ts_data_inicio")
@@ -547,10 +554,7 @@ def render_placa_ao_vivo():
         data_fim = st.date_input("Até:", key="ts_data_fim")
     with col_p3:
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        if st.button("📆 Só hoje", use_container_width=True, key="btn_ts_hoje"):
-            st.session_state["ts_data_inicio"] = hoje
-            st.session_state["ts_data_fim"] = hoje
-            st.rerun()
+        st.button("📆 Só hoje", use_container_width=True, key="btn_ts_hoje", on_click=_definir_periodo_hoje)
     with col_p4:
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
         if st.button("🔄 Atualizar", use_container_width=True, key="btn_atualizar_thingspeak"):
