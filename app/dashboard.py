@@ -246,51 +246,34 @@ THINGSPEAK_CAMPOS = {
     "field8": {"nome": "Temperatura Externa", "unidade": "°C", "cor": "#a78bfa"},
 }
 
-@st.cache_data(ttl=15)
-def buscar_dados_thingspeak(n_resultados=30):
-    """Busca as últimas leituras de TODOS os fields do canal ThingSpeak (canal privado)"""
-    url = f"https://api.thingspeak.com/channels/{THINGSPEAK_CHANNEL_ID}/feeds.json"
-    params = {"api_key": THINGSPEAK_READ_API_KEY, "results": n_resultados}
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        feeds = data.get("feeds", [])
-
-        registros = []
-        for f in feeds:
-            registro = {"timestamp": pd.to_datetime(f.get("created_at"))}
-            for campo in THINGSPEAK_CAMPOS:
-                registro[campo] = pd.to_numeric(f.get(campo), errors="coerce")
-            registros.append(registro)
-
-        df_ts = pd.DataFrame(registros)
-        if not df_ts.empty:
-            df_ts = df_ts.dropna(subset=["timestamp"]).sort_values("timestamp")
-        return df_ts
-    except Exception as e:
-        st.error(f"Erro ao buscar dados do ThingSpeak: {e}")
-        return pd.DataFrame()
+def agora_brasil():
+    """Retorna o datetime atual no horário de Brasília (UTC-3), não importa o fuso do servidor."""
+    return datetime.utcnow() - pd.Timedelta(hours=3)
 
 @st.cache_data(ttl=60)
 def buscar_historico_thingspeak(data_inicio, data_fim):
     """
-    Busca o HISTÓRICO COMPLETO do ThingSpeak entre duas datas (inclusive),
-    usando os parâmetros start/end da API (em vez do "últimos N resultados").
-    Como o ThingSpeak limita cada chamada a 8000 registros, paginamos:
-    a cada resposta, avançamos o 'start' para logo após o último timestamp
-    recebido, até cobrir o período inteiro pedido.
+    Busca o histórico do ThingSpeak entre duas datas (inclusive), já no horário de
+    Brasília (UTC-3). O ThingSpeak grava tudo em UTC, então:
+      1) convertemos o período pedido (horário local) para UTC antes de consultar a API;
+      2) convertemos cada timestamp recebido de volta para horário local antes de devolver.
+    Sem isso, uma leitura feita às 22h de um dia no Brasil chega marcada como
+    01h do dia seguinte em UTC — e "hoje" na tela virava "amanhã".
+    Pagina automaticamente porque o ThingSpeak limita 8000 registros por chamada.
     """
     url = f"https://api.thingspeak.com/channels/{THINGSPEAK_CHANNEL_ID}/feeds.json"
     todos_registros = []
-    inicio_atual = datetime.combine(data_inicio, datetime.min.time())
-    fim = datetime.combine(data_fim, datetime.max.time())
 
-    while inicio_atual <= fim:
+    # Período pedido é local (Brasil) -> converte para UTC para consultar a API
+    inicio_utc = datetime.combine(data_inicio, datetime.min.time()) + pd.Timedelta(hours=3)
+    fim_utc = datetime.combine(data_fim, datetime.max.time()) + pd.Timedelta(hours=3)
+    inicio_atual = inicio_utc
+
+    while inicio_atual <= fim_utc:
         params = {
             "api_key": THINGSPEAK_READ_API_KEY,
             "start": inicio_atual.strftime("%Y-%m-%d %H:%M:%S"),
-            "end": fim.strftime("%Y-%m-%d %H:%M:%S"),
+            "end": fim_utc.strftime("%Y-%m-%d %H:%M:%S"),
             "results": 8000,
         }
         try:
@@ -305,10 +288,9 @@ def buscar_historico_thingspeak(data_inicio, data_fim):
             break
 
         for f in feeds:
-            ts = pd.to_datetime(f.get("created_at"))
-            if ts is not None and ts.tzinfo is not None:
-                ts = ts.tz_convert(None)
-            registro = {"timestamp": ts}
+            ts_utc = pd.to_datetime(f.get("created_at"), utc=True)
+            ts_local = ts_utc.tz_convert(None) - pd.Timedelta(hours=3) if pd.notna(ts_utc) else pd.NaT
+            registro = {"timestamp": ts_local}
             for campo in THINGSPEAK_CAMPOS:
                 registro[campo] = pd.to_numeric(f.get(campo), errors="coerce")
             todos_registros.append(registro)
@@ -317,10 +299,8 @@ def buscar_historico_thingspeak(data_inicio, data_fim):
         if len(feeds) < 8000:
             break
 
-        ultimo_ts = pd.to_datetime(feeds[-1]["created_at"])
-        if ultimo_ts.tzinfo is not None:
-            ultimo_ts = ultimo_ts.tz_convert(None)
-        inicio_atual = ultimo_ts.to_pydatetime() + pd.Timedelta(seconds=1)
+        ultimo_ts_utc = pd.to_datetime(feeds[-1]["created_at"], utc=True).tz_convert(None)
+        inicio_atual = ultimo_ts_utc + pd.Timedelta(seconds=1)
 
     df_hist = pd.DataFrame(todos_registros)
     if not df_hist.empty:
@@ -548,21 +528,51 @@ def verificar_e_enviar_alerta_email(compensa_limpar: bool, mensagem_alerta: str)
 # ============================================================================
 
 def render_placa_ao_vivo():
-    """Aba que mostra dados ao vivo vindos do ThingSpeak (todos os 8 fields do canal)"""
+    """Aba que mostra os dados do ThingSpeak (todos os 8 fields do canal) para o período escolhido"""
     st.subheader("☀️ Minha Placa ao Vivo — ThingSpeak")
 
-    if st.button("🔄 Atualizar agora", key="btn_atualizar_thingspeak"):
-        st.cache_data.clear()
-        st.rerun()
+    # ============================================================================
+    # 📅 PERÍODO DE ANÁLISE — controla TUDO nesta aba (cards, gráficos e tabelas)
+    # ============================================================================
+    hoje = agora_brasil().date()
+    if "ts_data_inicio" not in st.session_state:
+        st.session_state["ts_data_inicio"] = hoje
+    if "ts_data_fim" not in st.session_state:
+        st.session_state["ts_data_fim"] = hoje
 
-    df_ts = buscar_dados_thingspeak()
+    col_p1, col_p2, col_p3, col_p4 = st.columns([1, 1, 1, 1])
+    with col_p1:
+        data_inicio = st.date_input("De:", key="ts_data_inicio")
+    with col_p2:
+        data_fim = st.date_input("Até:", key="ts_data_fim")
+    with col_p3:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        if st.button("📆 Só hoje", use_container_width=True, key="btn_ts_hoje"):
+            st.session_state["ts_data_inicio"] = hoje
+            st.session_state["ts_data_fim"] = hoje
+            st.rerun()
+    with col_p4:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        if st.button("🔄 Atualizar", use_container_width=True, key="btn_atualizar_thingspeak"):
+            st.cache_data.clear()
+            st.rerun()
+
+    if data_inicio > data_fim:
+        st.error("A data 'De' não pode ser depois da data 'Até'.")
+        return
+
+    with st.spinner("Buscando dados do ThingSpeak..."):
+        df_ts = buscar_historico_thingspeak(data_inicio, data_fim)
 
     if df_ts.empty:
-        st.warning("⚠️ Sem dados no ThingSpeak ainda.")
+        st.warning("⚠️ Sem dados no ThingSpeak para o período selecionado.")
         return
 
     ultima = df_ts.iloc[-1]
-    st.caption(f"Última leitura: {ultima['timestamp'].strftime('%d/%m/%Y %H:%M:%S')}")
+    st.caption(
+        f"Período: {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')} "
+        f"— {len(df_ts)} leituras — última: {ultima['timestamp'].strftime('%d/%m/%Y %H:%M:%S')} (horário de Brasília)"
+    )
 
     # Cards com o valor mais recente de cada field
     st.subheader("Valores Atuais")
@@ -585,7 +595,7 @@ def render_placa_ao_vivo():
 
     st.markdown("---")
 
-    # Gráfico comparativo: Placa Suja vs Placa Limpa (potência)
+    # Gráfico comparativo: Placa Suja vs Placa Limpa (potência) — período inteiro, escala única
     st.subheader("Potência: Placa Suja vs Placa Limpa")
     fig_pot = go.Figure()
     fig_pot.add_trace(go.Scatter(
@@ -599,7 +609,7 @@ def render_placa_ao_vivo():
     fig_pot.update_layout(**LAY, title="Potência (W)", yaxis_title="W")
     st.plotly_chart(fig_pot, use_container_width=True)
 
-    # Um gráfico de histórico para cada field, dois por linha
+    # Um gráfico de histórico para cada field, dois por linha — mesmo período, escala única
     st.subheader("Histórico por Sensor")
     itens = list(THINGSPEAK_CAMPOS.items())
     for i in range(0, len(itens), 2):
@@ -615,28 +625,21 @@ def render_placa_ao_vivo():
                 fig.update_layout(**LAY, title=f"{info['nome']} ({info['unidade']})", yaxis_title=info["unidade"])
                 st.plotly_chart(fig, use_container_width=True)
 
-    with st.expander("📋 Ver leituras brutas (últimas 30)"):
-        st.dataframe(df_ts.sort_values("timestamp", ascending=False), use_container_width=True)
+    with st.expander(f"📋 Ver todas as leituras do período ({len(df_ts)})"):
+        st.dataframe(df_ts.sort_values("timestamp", ascending=False), use_container_width=True, hide_index=True)
 
     # ============================================================================
-    # 📅 HISTÓRICO COMPLETO POR PERÍODO (tabela, não gráfico)
+    # 📅 HISTÓRICO POR DATA — mesma consulta acima, organizada em tabela por dia
     # ============================================================================
     st.markdown("---")
-    st.subheader("📅 Histórico Completo por Período")
+    st.subheader("📅 Histórico Organizado por Data")
     st.caption(
-        "Consulte todo o histórico já registrado no ThingSpeak, no período que você escolher — "
-        "em tabela organizada por data, não em gráfico. Também dá pra ver só o **pico do dia** "
-        "(o maior valor de cada dia) em vez de todas as leituras."
+        "O mesmo período selecionado acima, agora organizado por dia em tabela — "
+        "dá pra ver todas as leituras de cada dia, ou só o **pico** (maior valor) de cada dia."
     )
 
-    col_h1, col_h2, col_h3 = st.columns([1, 1, 1.4])
+    col_h1, col_h2 = st.columns([1.4, 1])
     with col_h1:
-        hist_data_inicio = st.date_input(
-            "De:", value=datetime.now().date().replace(day=1), key="hist_data_inicio"
-        )
-    with col_h2:
-        hist_data_fim = st.date_input("Até:", value=datetime.now().date(), key="hist_data_fim")
-    with col_h3:
         campo_pico = st.selectbox(
             "Campo para calcular o pico:",
             options=list(THINGSPEAK_CAMPOS.keys()),
@@ -644,78 +647,57 @@ def render_placa_ao_vivo():
             index=0,
             key="hist_campo_pico",
         )
+    with col_h2:
+        modo_hist = st.radio(
+            "Como exibir:",
+            ["📋 Todos os registros", "📈 Somente o pico de cada dia"],
+            key="hist_modo",
+        )
 
-    modo_hist = st.radio(
-        "Como exibir:",
-        ["📋 Todos os registros", "📈 Somente o pico de cada dia"],
-        horizontal=True,
-        key="hist_modo",
-    )
+    df_hist = df_ts.copy()
+    df_hist["data"] = df_hist["timestamp"].dt.date
+    df_hist["hora"] = df_hist["timestamp"].dt.strftime("%H:%M:%S")
 
-    if st.button("🔍 Buscar histórico", use_container_width=True, key="btn_buscar_historico"):
-        if hist_data_inicio > hist_data_fim:
-            st.error("A data 'De' não pode ser depois da data 'Até'.")
+    nomes_colunas = {
+        c: f'{THINGSPEAK_CAMPOS[c]["nome"]} ({THINGSPEAK_CAMPOS[c]["unidade"]})'
+        for c in THINGSPEAK_CAMPOS
+    }
+    nomes_colunas["hora"] = "Hora"
+    nomes_colunas["Data"] = "Data"
+
+    if modo_hist.startswith("📋"):
+        # Todos os registros, agrupados por dia (do mais recente para o mais antigo)
+        for dia in sorted(df_hist["data"].unique(), reverse=True):
+            df_dia = df_hist[df_hist["data"] == dia].sort_values("timestamp", ascending=False)
+            with st.expander(f"📆 {dia.strftime('%d/%m/%Y')} — {len(df_dia)} leituras"):
+                colunas = ["hora"] + list(THINGSPEAK_CAMPOS.keys())
+                st.dataframe(
+                    df_dia[colunas].rename(columns=nomes_colunas),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+    else:
+        # Somente o pico (valor máximo do campo escolhido) de cada dia
+        linhas_pico = []
+        for dia, df_dia in df_hist.groupby("data"):
+            if df_dia[campo_pico].notna().any():
+                linhas_pico.append(df_hist.loc[df_dia[campo_pico].idxmax()])
+
+        if not linhas_pico:
+            st.warning("Não há dados suficientes para calcular picos nesse período.")
         else:
-            with st.spinner("Buscando histórico completo no ThingSpeak... (pode demorar em períodos longos)"):
-                st.session_state["df_historico_ts"] = buscar_historico_thingspeak(hist_data_inicio, hist_data_fim)
-            st.session_state["hist_periodo"] = (hist_data_inicio, hist_data_fim)
+            df_picos = pd.DataFrame(linhas_pico).sort_values("data", ascending=False)
+            df_picos["Data"] = df_picos["data"].apply(lambda d: d.strftime("%d/%m/%Y"))
+            colunas_pico = ["Data", "hora"] + list(THINGSPEAK_CAMPOS.keys())
+            tabela_picos = df_picos[colunas_pico].rename(columns=nomes_colunas)
+            st.dataframe(tabela_picos, use_container_width=True, hide_index=True)
+            st.caption(f"Pico calculado com base em: **{THINGSPEAK_CAMPOS[campo_pico]['nome']}**")
 
-    df_hist = st.session_state.get("df_historico_ts")
-
-    if df_hist is not None:
-        if df_hist.empty:
-            st.warning("Nenhum registro encontrado nesse período.")
-        else:
-            p_ini, p_fim = st.session_state.get("hist_periodo", (hist_data_inicio, hist_data_fim))
-            st.success(
-                f"{len(df_hist)} registros encontrados entre "
-                f"{p_ini.strftime('%d/%m/%Y')} e {p_fim.strftime('%d/%m/%Y')}."
+            csv = tabela_picos.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Baixar picos em CSV", csv, "picos_por_dia.csv", "text/csv",
+                use_container_width=True,
             )
-
-            df_hist = df_hist.copy()
-            df_hist["data"] = df_hist["timestamp"].dt.date
-            df_hist["hora"] = df_hist["timestamp"].dt.strftime("%H:%M:%S")
-
-            nomes_colunas = {
-                c: f'{THINGSPEAK_CAMPOS[c]["nome"]} ({THINGSPEAK_CAMPOS[c]["unidade"]})'
-                for c in THINGSPEAK_CAMPOS
-            }
-            nomes_colunas["hora"] = "Hora"
-            nomes_colunas["Data"] = "Data"
-
-            if modo_hist.startswith("📋"):
-                # Todos os registros, agrupados por dia (do mais recente para o mais antigo)
-                for dia in sorted(df_hist["data"].unique(), reverse=True):
-                    df_dia = df_hist[df_hist["data"] == dia].sort_values("timestamp", ascending=False)
-                    with st.expander(f"📆 {dia.strftime('%d/%m/%Y')} — {len(df_dia)} leituras"):
-                        colunas = ["hora"] + list(THINGSPEAK_CAMPOS.keys())
-                        st.dataframe(
-                            df_dia[colunas].rename(columns=nomes_colunas),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-            else:
-                # Somente o pico (valor máximo do campo escolhido) de cada dia
-                linhas_pico = []
-                for dia, df_dia in df_hist.groupby("data"):
-                    if df_dia[campo_pico].notna().any():
-                        linhas_pico.append(df_hist.loc[df_dia[campo_pico].idxmax()])
-
-                if not linhas_pico:
-                    st.warning("Não há dados suficientes para calcular picos nesse período.")
-                else:
-                    df_picos = pd.DataFrame(linhas_pico).sort_values("data", ascending=False)
-                    df_picos["Data"] = df_picos["data"].apply(lambda d: d.strftime("%d/%m/%Y"))
-                    colunas_pico = ["Data", "hora"] + list(THINGSPEAK_CAMPOS.keys())
-                    tabela_picos = df_picos[colunas_pico].rename(columns=nomes_colunas)
-                    st.dataframe(tabela_picos, use_container_width=True, hide_index=True)
-                    st.caption(f"Pico calculado com base em: **{THINGSPEAK_CAMPOS[campo_pico]['nome']}**")
-
-                    csv = tabela_picos.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "⬇️ Baixar picos em CSV", csv, "picos_por_dia.csv", "text/csv",
-                        use_container_width=True,
-                    )
 
 # ============================================================================
 # 🎯 FUNÇÃO PRINCIPAL
