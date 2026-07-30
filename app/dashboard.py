@@ -159,8 +159,9 @@ def gravar_potencia(potencia):
         st.error(f"Erro ao gravar na planilha: {e}")
         return False
 
-def gravar_email_alerta(email):
-    """Grava o e-mail de alerta na planilha do Google Sheets (célula I2), para persistir entre sessões."""
+def gravar_emails_alerta(emails):
+    """Grava a lista de e-mails de alerta (até 10) na planilha do Google Sheets
+    (célula I2, separados por vírgula), para persistir entre sessões."""
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         if "gcp_service_account" in st.secrets:
@@ -171,15 +172,17 @@ def gravar_email_alerta(email):
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(SHEET_ID)
         ws = sh.sheet1
-        ws.update("I2", [[email]])
+        ws.update("I2", [[", ".join(emails)]])
         return True
     except Exception as e:
-        st.error(f"Erro ao gravar e-mail na planilha: {e}")
+        st.error(f"Erro ao gravar e-mails na planilha: {e}")
         return False
 
 @st.cache_data(ttl=30)
-def carregar_email_alerta():
-    """Lê o e-mail de alerta salvo na planilha (célula I2). Retorna string vazia se não houver."""
+def carregar_emails_alerta():
+    """Lê a lista de e-mails de alerta salva na planilha (célula I2, separados por
+    vírgula). Retorna o e-mail padrão se a planilha nunca foi usada, ou lista
+    vazia em caso de erro."""
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         if "gcp_service_account" in st.secrets:
@@ -191,9 +194,11 @@ def carregar_email_alerta():
         sh = gc.open_by_key(SHEET_ID)
         ws = sh.sheet1
         valor = ws.acell("I2").value
-        return valor.strip() if valor else EMAIL_ALERTA_PADRAO
+        if not valor or not valor.strip():
+            return [EMAIL_ALERTA_PADRAO]
+        return [e.strip() for e in valor.split(",") if e.strip()][:10]
     except Exception:
-        return ""
+        return []
 
 @st.cache_data(ttl=60)
 def carregar_sheets():
@@ -407,18 +412,24 @@ def email_valido(email: str) -> bool:
     """Validação simples de formato de e-mail."""
     return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email) is not None
 
-def enviar_email_gmail(remetente: str, senha_app: str, destinatario: str, assunto: str, mensagem: str):
-    """Envia e-mail via Gmail SMTP. Retorna (sucesso: bool, detalhe: str)."""
+def enviar_email_gmail(remetente: str, senha_app: str, destinatarios, assunto: str, mensagem: str):
+    """Envia e-mail via Gmail SMTP para um ou mais destinatários (lista de até 10).
+    Retorna (sucesso: bool, detalhe: str)."""
+    if isinstance(destinatarios, str):
+        destinatarios = [destinatarios]
+    destinatarios = [d.strip() for d in destinatarios if d and d.strip()]
+    if not destinatarios:
+        return False, "Nenhum destinatário informado."
     try:
         msg = MIMEText(mensagem)
         msg["Subject"] = assunto
         msg["From"] = remetente
-        msg["To"] = destinatario
+        msg["To"] = ", ".join(destinatarios)
 
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as servidor:
             servidor.starttls()
             servidor.login(remetente, senha_app)
-            servidor.sendmail(remetente, [destinatario], msg.as_string())
+            servidor.sendmail(remetente, destinatarios, msg.as_string())
         return True, "OK"
     except smtplib.SMTPAuthenticationError:
         return False, "Falha de autenticação — confira o e-mail e a Senha de app do Gmail (configurados em secrets.toml)."
@@ -427,38 +438,91 @@ def enviar_email_gmail(remetente: str, senha_app: str, destinatario: str, assunt
 
 def render_aba_email():
     """
-    Aba onde o cliente final só digita o e-mail dele (sem nenhum cadastro).
-    O e-mail é salvo na planilha do Google Sheets (persiste entre sessões e
-    reinicializações do app). A partir daí, o app envia automaticamente um
-    alerta por e-mail sempre que detectar que compensa limpar a placa.
+    Aba onde o cliente final cadastra até 10 e-mails para receber alerta automático
+    (sem nenhuma senha ou cadastro complexo). A lista fica salva na planilha do
+    Google Sheets (persiste entre sessões e reinicializações do app). Sempre que
+    o sistema detectar que compensa limpar a placa, TODOS os e-mails da lista
+    recebem o alerta.
     """
     st.subheader("📧 Alertas por e-mail")
     st.caption(
-        "Digite seu e-mail abaixo. Sempre que o sistema detectar que a limpeza da "
-        "placa compensa financeiramente, você recebe um alerta automático — não é "
-        "preciso nenhum cadastro."
+        "Cadastre até **10 e-mails** abaixo. Sempre que o sistema detectar que a limpeza "
+        "da placa compensa financeiramente, todos eles recebem um alerta automático — "
+        "não é preciso nenhum cadastro."
     )
 
-    if "email_alerta" not in st.session_state:
-        st.session_state["email_alerta"] = carregar_email_alerta()
+    if "emails_alerta" not in st.session_state:
+        st.session_state["emails_alerta"] = carregar_emails_alerta()
     if "ultimo_alerta_enviado" not in st.session_state:
         st.session_state["ultimo_alerta_enviado"] = False
+    if "erro_email" not in st.session_state:
+        st.session_state["erro_email"] = ""
 
-    email_cliente = st.text_input(
-        "Seu e-mail",
-        value=st.session_state["email_alerta"],
-        placeholder="seuemail@exemplo.com",
-    )
-
-    if email_cliente and not email_valido(email_cliente):
-        st.error("Informe um e-mail válido.")
-    elif email_cliente and email_cliente != st.session_state["email_alerta"]:
-        st.session_state["email_alerta"] = email_cliente
-        if gravar_email_alerta(email_cliente):
+    def _adicionar_email():
+        novo = st.session_state.get("novo_email_input", "").strip()
+        lista = list(st.session_state.get("emails_alerta", []))
+        if not novo:
+            return
+        if not email_valido(novo):
+            st.session_state["erro_email"] = "E-mail inválido. Confira o formato digitado."
+            return
+        if novo.lower() in [e.lower() for e in lista]:
+            st.session_state["erro_email"] = "Esse e-mail já está na lista."
+            return
+        if len(lista) >= 10:
+            st.session_state["erro_email"] = "Limite de 10 e-mails atingido. Remova algum para adicionar outro."
+            return
+        lista.append(novo)
+        st.session_state["emails_alerta"] = lista
+        st.session_state["erro_email"] = ""
+        if gravar_emails_alerta(lista):
             st.cache_data.clear()
-            st.success("E-mail salvo! Você receberá um alerta automático quando compensar limpar a placa.")
-    elif email_cliente:
-        st.success("E-mail salvo. Você receberá um alerta automático quando compensar limpar a placa.")
+        st.session_state["novo_email_input"] = ""
+
+    def _remover_email(indice):
+        def _callback():
+            lista = list(st.session_state.get("emails_alerta", []))
+            if 0 <= indice < len(lista):
+                lista.pop(indice)
+                st.session_state["emails_alerta"] = lista
+                if gravar_emails_alerta(lista):
+                    st.cache_data.clear()
+        return _callback
+
+    emails = st.session_state["emails_alerta"]
+
+    st.markdown(f"**E-mails cadastrados ({len(emails)}/10):**")
+    if not emails:
+        st.info("Nenhum e-mail cadastrado ainda. Adicione um abaixo.")
+    else:
+        for i, e in enumerate(emails):
+            col_e1, col_e2 = st.columns([5, 1])
+            with col_e1:
+                st.markdown(
+                    f'<div class="card" style="text-align:left;padding:10px 16px;margin-bottom:6px">'
+                    f'<span style="color:#f1f5f9">📩 {e}</span></div>',
+                    unsafe_allow_html=True,
+                )
+            with col_e2:
+                st.button(
+                    "🗑️ Remover", key=f"remover_email_{i}", use_container_width=True,
+                    on_click=_remover_email(i),
+                )
+
+    if len(emails) < 10:
+        col_a1, col_a2 = st.columns([4, 1])
+        with col_a1:
+            st.text_input(
+                "Adicionar e-mail", key="novo_email_input",
+                placeholder="seuemail@exemplo.com", label_visibility="collapsed",
+            )
+        with col_a2:
+            st.button("➕ Adicionar", use_container_width=True, on_click=_adicionar_email)
+    else:
+        st.warning("Limite de 10 e-mails atingido. Remova algum da lista acima para adicionar outro.")
+
+    if st.session_state.get("erro_email"):
+        st.error(st.session_state["erro_email"])
 
     st.markdown("---")
     st.subheader("🧪 Diagnóstico e teste manual")
@@ -475,33 +539,38 @@ def render_aba_email():
         )
 
     if st.button("📨 Enviar e-mail de teste agora", use_container_width=True):
-        if not email_cliente or not email_valido(email_cliente):
-            st.error("Digite um e-mail válido no campo acima antes de testar.")
+        emails_validos = [e for e in st.session_state.get("emails_alerta", []) if email_valido(e)]
+        if not emails_validos:
+            st.error("Cadastre ao menos um e-mail válido na lista acima antes de testar.")
         elif not remetente or not senha_app:
             st.error("Não é possível testar: credenciais do Gmail não configuradas nos Secrets.")
         else:
-            with st.spinner("Enviando e-mail de teste..."):
+            with st.spinner(f"Enviando e-mail de teste para {len(emails_validos)} destinatário(s)..."):
                 sucesso, detalhe = enviar_email_gmail(
-                    remetente, senha_app, email_cliente,
+                    remetente, senha_app, emails_validos,
                     "TCC Solar - Teste de notificação",
                     "Esta é uma mensagem de teste enviada manualmente pela aba de e-mail do TCC Solar.",
                 )
             if sucesso:
-                st.success("✅ E-mail de teste enviado! Confira a caixa de entrada (e o Spam) em alguns segundos.")
+                st.success(
+                    f"✅ E-mail de teste enviado para {len(emails_validos)} destinatário(s)! "
+                    "Confira a caixa de entrada (e o Spam) em alguns segundos."
+                )
             else:
                 st.error(f"❌ Falha ao enviar: {detalhe}")
 
 def verificar_e_enviar_alerta_email(compensa_limpar: bool, mensagem_alerta: str):
     """
-    Chamada a cada carregamento da página: se 'compensa_limpar' for True e houver um
-    e-mail salvo na sessão, envia o alerta automaticamente (uma vez só por ocorrência,
-    evitando reenviar a cada atualização da página).
+    Chamada a cada carregamento da página: se 'compensa_limpar' for True e houver
+    e-mails cadastrados na sessão, envia o alerta automaticamente para TODOS eles
+    (uma vez só por ocorrência, evitando reenviar a cada atualização da página).
     """
-    email_cliente = st.session_state.get("email_alerta", "")
-    if not email_cliente:
-        email_cliente = carregar_email_alerta()
-        st.session_state["email_alerta"] = email_cliente
-    if not email_cliente or not email_valido(email_cliente):
+    emails = st.session_state.get("emails_alerta")
+    if emails is None:
+        emails = carregar_emails_alerta()
+        st.session_state["emails_alerta"] = emails
+    emails_validos = [e for e in emails if email_valido(e)]
+    if not emails_validos:
         return
 
     remetente = st.secrets.get("gmail_remetente", "") if hasattr(st, "secrets") else ""
@@ -511,13 +580,13 @@ def verificar_e_enviar_alerta_email(compensa_limpar: bool, mensagem_alerta: str)
 
     if compensa_limpar and not st.session_state.get("ultimo_alerta_enviado", False):
         sucesso, _ = enviar_email_gmail(
-            remetente, senha_app, email_cliente,
+            remetente, senha_app, emails_validos,
             "TCC Solar - Limpeza da placa recomendada",
             mensagem_alerta,
         )
         st.session_state["ultimo_alerta_enviado"] = True
         if sucesso:
-            st.toast("📧 Alerta enviado por e-mail!")
+            st.toast(f"📧 Alerta enviado para {len(emails_validos)} e-mail(s)!")
     elif not compensa_limpar:
         # Reseta a trava assim que a placa deixa de precisar de limpeza,
         # para que um novo alerta seja disparado na próxima vez que voltar a compensar.
