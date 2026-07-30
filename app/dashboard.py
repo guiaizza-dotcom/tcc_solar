@@ -35,7 +35,7 @@ st.set_page_config(
 
 pwa_html = """
 <link rel="manifest" href="https://raw.githubusercontent.com/guiaizza-dotcom/tcc_solar/main/.streamlit/app_manifest.json">
-<meta name="theme-color" content="#FFA500">
+<meta name="theme-color" content="#FACC15">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="TCC Solar">
@@ -68,17 +68,73 @@ THINGSPEAK_FIELD_IRRADIANCIA = 7  # Field 7 = Irradiação
 # ============================================================================
 
 st.markdown("""<style>
-.stApp{background:linear-gradient(180deg,#2E1065 0%,#6D28D9 100%)}
-h1{color:#facc15!important}
-h2,h3{color:#e2e8f0!important}
-.card{background:linear-gradient(135deg,#1e293b,#0f172a);border:1px solid #334155;border-radius:14px;padding:18px 14px;text-align:center;margin-bottom:10px}
-.card-title{font-size:11px;color:#94a3b8;margin-bottom:4px;text-transform:uppercase}
-.card-value{font-size:28px;font-weight:700;color:#f1f5f9}
-.card-unit{font-size:11px;color:#475569;margin-top:2px}
-.decision-box{border-radius:14px;padding:22px 28px;font-size:17px;font-weight:600;text-align:center;margin:8px 0 16px 0}
-.ok{background:#14532d;border:2px solid #22c55e;color:#bbf7d0}
-.alert{background:#7f1d1d;border:2px solid #ef4444;color:#fecaca}
-.warn{background:#713f12;border:2px solid #f59e0b;color:#fef3c7}
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');
+
+html, body, [class*="css"], .stMarkdown, p, span, label { font-family:'Inter',sans-serif; }
+
+/* 🌇 Fundo: céu ao entardecer com um brilho de sol no canto — o painel "olha" pro céu */
+.stApp{
+    background:
+        radial-gradient(ellipse 900px 520px at 88% -6%, rgba(250,204,21,0.20), transparent 60%),
+        linear-gradient(180deg,#071B2E 0%,#0B3D5C 32%,#0E4C6E 58%,#071B2E 100%);
+}
+
+h1,h2,h3{ font-family:'Space Grotesk',sans-serif; letter-spacing:.2px; }
+h1{color:#facc15!important; text-shadow:0 0 22px rgba(250,204,21,.35);}
+h2,h3{color:#bae6fd!important}
+
+/* 🔲 Cards com cara de célula fotovoltaica: fundo escuro + grade + brilho diagonal (vidro) */
+.card{
+    background-color:#0b2239;
+    background-image:
+        linear-gradient(#123a63 1px, transparent 1px),
+        linear-gradient(90deg,#123a63 1px, transparent 1px);
+    background-size:18px 18px;
+    border:1px solid #1e6091;
+    border-radius:10px;
+    padding:18px 14px;
+    text-align:center;
+    margin-bottom:10px;
+    position:relative;
+    overflow:hidden;
+}
+.card::after{
+    content:"";
+    position:absolute; inset:0; pointer-events:none;
+    background:linear-gradient(115deg, transparent 42%, rgba(255,255,255,.06) 50%, transparent 58%);
+}
+.card-title{font-size:11px;color:#7da9c7;margin-bottom:4px;text-transform:uppercase;letter-spacing:.06em;position:relative;z-index:1}
+.card-value{font-size:28px;font-weight:700;color:#f1f5f9;position:relative;z-index:1}
+.card-unit{font-size:11px;color:#3e6c8f;margin-top:2px;position:relative;z-index:1}
+
+/* 🚦 Caixa de diagnóstico */
+.decision-box{border-radius:10px;padding:22px 28px;font-size:17px;font-weight:600;text-align:center;margin:8px 0 16px 0;border-width:2px;border-style:solid}
+.ok{background:#0b3b24;border-color:#22c55e;color:#bbf7d0}
+.alert{background:#4a1416;border-color:#ef4444;color:#fecaca}
+.warn{background:#4a320b;border-color:#f59e0b;color:#fef3c7}
+
+/* 📱 Sidebar com o mesmo tom de céu/painel + filete dourado */
+section[data-testid="stSidebar"]{
+    background:linear-gradient(180deg,#071b2e 0%,#0b2239 100%);
+    border-right:1px solid rgba(245,158,11,.25);
+}
+
+/* ☀️ Botões: dourado do sol, como se fossem "energia" clicável */
+.stButton>button{
+    background:linear-gradient(135deg,#facc15,#f59e0b);
+    color:#1a1a1a; font-weight:700; border:none; border-radius:8px;
+    transition:box-shadow .2s ease, transform .2s ease;
+}
+.stButton>button:hover{
+    box-shadow:0 0 16px rgba(250,204,21,.5);
+    transform:translateY(-1px);
+    color:#1a1a1a;
+}
+
+/* 📑 Abas: destaque dourado na aba ativa */
+.stTabs [aria-selected="true"]{ color:#facc15!important; border-bottom-color:#facc15!important; }
+
+hr{ border-color:rgba(30,96,145,.5)!important; }
 </style>""", unsafe_allow_html=True)
 
 # ============================================================================
@@ -215,6 +271,61 @@ def buscar_dados_thingspeak(n_resultados=30):
     except Exception as e:
         st.error(f"Erro ao buscar dados do ThingSpeak: {e}")
         return pd.DataFrame()
+
+@st.cache_data(ttl=60)
+def buscar_historico_thingspeak(data_inicio, data_fim):
+    """
+    Busca o HISTÓRICO COMPLETO do ThingSpeak entre duas datas (inclusive),
+    usando os parâmetros start/end da API (em vez do "últimos N resultados").
+    Como o ThingSpeak limita cada chamada a 8000 registros, paginamos:
+    a cada resposta, avançamos o 'start' para logo após o último timestamp
+    recebido, até cobrir o período inteiro pedido.
+    """
+    url = f"https://api.thingspeak.com/channels/{THINGSPEAK_CHANNEL_ID}/feeds.json"
+    todos_registros = []
+    inicio_atual = datetime.combine(data_inicio, datetime.min.time())
+    fim = datetime.combine(data_fim, datetime.max.time())
+
+    while inicio_atual <= fim:
+        params = {
+            "api_key": THINGSPEAK_READ_API_KEY,
+            "start": inicio_atual.strftime("%Y-%m-%d %H:%M:%S"),
+            "end": fim.strftime("%Y-%m-%d %H:%M:%S"),
+            "results": 8000,
+        }
+        try:
+            resp = requests.get(url, params=params, timeout=20)
+            resp.raise_for_status()
+            feeds = resp.json().get("feeds", [])
+        except Exception as e:
+            st.error(f"Erro ao buscar histórico do ThingSpeak: {e}")
+            break
+
+        if not feeds:
+            break
+
+        for f in feeds:
+            ts = pd.to_datetime(f.get("created_at"))
+            if ts is not None and ts.tzinfo is not None:
+                ts = ts.tz_convert(None)
+            registro = {"timestamp": ts}
+            for campo in THINGSPEAK_CAMPOS:
+                registro[campo] = pd.to_numeric(f.get(campo), errors="coerce")
+            todos_registros.append(registro)
+
+        # Se voltou menos que o limite de página, já cobrimos tudo
+        if len(feeds) < 8000:
+            break
+
+        ultimo_ts = pd.to_datetime(feeds[-1]["created_at"])
+        if ultimo_ts.tzinfo is not None:
+            ultimo_ts = ultimo_ts.tz_convert(None)
+        inicio_atual = ultimo_ts.to_pydatetime() + pd.Timedelta(seconds=1)
+
+    df_hist = pd.DataFrame(todos_registros)
+    if not df_hist.empty:
+        df_hist = df_hist.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    return df_hist
 
 def analisar(df, potencia_w):
     """Analisa os dados e calcula se compensa limpar"""
@@ -504,8 +615,107 @@ def render_placa_ao_vivo():
                 fig.update_layout(**LAY, title=f"{info['nome']} ({info['unidade']})", yaxis_title=info["unidade"])
                 st.plotly_chart(fig, use_container_width=True)
 
-    with st.expander("📋 Ver leituras brutas"):
+    with st.expander("📋 Ver leituras brutas (últimas 30)"):
         st.dataframe(df_ts.sort_values("timestamp", ascending=False), use_container_width=True)
+
+    # ============================================================================
+    # 📅 HISTÓRICO COMPLETO POR PERÍODO (tabela, não gráfico)
+    # ============================================================================
+    st.markdown("---")
+    st.subheader("📅 Histórico Completo por Período")
+    st.caption(
+        "Consulte todo o histórico já registrado no ThingSpeak, no período que você escolher — "
+        "em tabela organizada por data, não em gráfico. Também dá pra ver só o **pico do dia** "
+        "(o maior valor de cada dia) em vez de todas as leituras."
+    )
+
+    col_h1, col_h2, col_h3 = st.columns([1, 1, 1.4])
+    with col_h1:
+        hist_data_inicio = st.date_input(
+            "De:", value=datetime.now().date().replace(day=1), key="hist_data_inicio"
+        )
+    with col_h2:
+        hist_data_fim = st.date_input("Até:", value=datetime.now().date(), key="hist_data_fim")
+    with col_h3:
+        campo_pico = st.selectbox(
+            "Campo para calcular o pico:",
+            options=list(THINGSPEAK_CAMPOS.keys()),
+            format_func=lambda c: THINGSPEAK_CAMPOS[c]["nome"],
+            index=0,
+            key="hist_campo_pico",
+        )
+
+    modo_hist = st.radio(
+        "Como exibir:",
+        ["📋 Todos os registros", "📈 Somente o pico de cada dia"],
+        horizontal=True,
+        key="hist_modo",
+    )
+
+    if st.button("🔍 Buscar histórico", use_container_width=True, key="btn_buscar_historico"):
+        if hist_data_inicio > hist_data_fim:
+            st.error("A data 'De' não pode ser depois da data 'Até'.")
+        else:
+            with st.spinner("Buscando histórico completo no ThingSpeak... (pode demorar em períodos longos)"):
+                st.session_state["df_historico_ts"] = buscar_historico_thingspeak(hist_data_inicio, hist_data_fim)
+            st.session_state["hist_periodo"] = (hist_data_inicio, hist_data_fim)
+
+    df_hist = st.session_state.get("df_historico_ts")
+
+    if df_hist is not None:
+        if df_hist.empty:
+            st.warning("Nenhum registro encontrado nesse período.")
+        else:
+            p_ini, p_fim = st.session_state.get("hist_periodo", (hist_data_inicio, hist_data_fim))
+            st.success(
+                f"{len(df_hist)} registros encontrados entre "
+                f"{p_ini.strftime('%d/%m/%Y')} e {p_fim.strftime('%d/%m/%Y')}."
+            )
+
+            df_hist = df_hist.copy()
+            df_hist["data"] = df_hist["timestamp"].dt.date
+            df_hist["hora"] = df_hist["timestamp"].dt.strftime("%H:%M:%S")
+
+            nomes_colunas = {
+                c: f'{THINGSPEAK_CAMPOS[c]["nome"]} ({THINGSPEAK_CAMPOS[c]["unidade"]})'
+                for c in THINGSPEAK_CAMPOS
+            }
+            nomes_colunas["hora"] = "Hora"
+            nomes_colunas["Data"] = "Data"
+
+            if modo_hist.startswith("📋"):
+                # Todos os registros, agrupados por dia (do mais recente para o mais antigo)
+                for dia in sorted(df_hist["data"].unique(), reverse=True):
+                    df_dia = df_hist[df_hist["data"] == dia].sort_values("timestamp", ascending=False)
+                    with st.expander(f"📆 {dia.strftime('%d/%m/%Y')} — {len(df_dia)} leituras"):
+                        colunas = ["hora"] + list(THINGSPEAK_CAMPOS.keys())
+                        st.dataframe(
+                            df_dia[colunas].rename(columns=nomes_colunas),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+            else:
+                # Somente o pico (valor máximo do campo escolhido) de cada dia
+                linhas_pico = []
+                for dia, df_dia in df_hist.groupby("data"):
+                    if df_dia[campo_pico].notna().any():
+                        linhas_pico.append(df_hist.loc[df_dia[campo_pico].idxmax()])
+
+                if not linhas_pico:
+                    st.warning("Não há dados suficientes para calcular picos nesse período.")
+                else:
+                    df_picos = pd.DataFrame(linhas_pico).sort_values("data", ascending=False)
+                    df_picos["Data"] = df_picos["data"].apply(lambda d: d.strftime("%d/%m/%Y"))
+                    colunas_pico = ["Data", "hora"] + list(THINGSPEAK_CAMPOS.keys())
+                    tabela_picos = df_picos[colunas_pico].rename(columns=nomes_colunas)
+                    st.dataframe(tabela_picos, use_container_width=True, hide_index=True)
+                    st.caption(f"Pico calculado com base em: **{THINGSPEAK_CAMPOS[campo_pico]['nome']}**")
+
+                    csv = tabela_picos.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇️ Baixar picos em CSV", csv, "picos_por_dia.csv", "text/csv",
+                        use_container_width=True,
+                    )
 
 # ============================================================================
 # 🎯 FUNÇÃO PRINCIPAL
