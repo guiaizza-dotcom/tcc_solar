@@ -54,9 +54,19 @@ CRED_FILE = "credenciais.json"
 EFICIENCIA = 0.85
 IRRADIANCIA_STC = 1000.0
 TARIFA_KWH = 0.75
-CUSTO_LIMPEZA = 5.00
 LIMIAR_SUJEIRA = 10.0
 EMAIL_ALERTA_PADRAO = "bittoleoguio@gmail.com"  # usado só se a planilha ainda não tiver e-mail salvo
+
+# --- 💧 Parâmetros de CUSTO DE LIMPEZA (valores padrão; editáveis na barra lateral) ---
+# O custo total deixa de ser um número fixo e passa a ser a SOMA dos insumos reais:
+# água + detergente + mão de obra + depreciação de equipamento (rodo/escova).
+AGUA_LITROS_PADRAO        = 5.0    # litros de água por limpeza
+AGUA_PRECO_M3_PADRAO      = 5.50   # R$ por m³ (veja na sua conta de água/saneamento)
+DETERGENTE_ML_PADRAO      = 20.0   # ml de detergente por limpeza
+DETERGENTE_PRECO_L_PADRAO = 8.00   # R$ por litro do detergente
+MAO_OBRA_MIN_PADRAO       = 10.0   # minutos gastos por limpeza
+MAO_OBRA_HORA_PADRAO      = 0.0    # R$/h da mão de obra (0 se você mesmo limpa)
+DEPRECIACAO_PADRAO        = 0.10   # R$ por limpeza (desgaste de rodo/escova amortizado)
 
 # --- ThingSpeak (Minha Placa ao Vivo) ---
 THINGSPEAK_CHANNEL_ID = "3337625"
@@ -136,6 +146,25 @@ section[data-testid="stSidebar"]{
 
 hr{ border-color:rgba(30,96,145,.5)!important; }
 </style>""", unsafe_allow_html=True)
+
+# ============================================================================
+# 💧 CUSTO DE LIMPEZA — calculado a partir dos insumos reais
+# ============================================================================
+
+def custo_total_limpeza(agua_litros, agua_preco_m3, detergente_ml, detergente_preco_l,
+                        mao_obra_min, mao_obra_hora, depreciacao):
+    """
+    Soma o custo REAL de uma limpeza a partir dos insumos, em R$:
+      - água:      (litros / 1000) m³ × preço do m³
+      - detergente:(ml / 1000) L    × preço do litro
+      - mão de obra:(minutos / 60) h × valor da hora
+      - depreciação de equipamento: valor fixo por limpeza
+    Retorna o custo total de UMA limpeza (R$).
+    """
+    custo_agua       = (agua_litros / 1000.0) * agua_preco_m3
+    custo_detergente = (detergente_ml / 1000.0) * detergente_preco_l
+    custo_mao_obra   = (mao_obra_min / 60.0) * mao_obra_hora
+    return custo_agua + custo_detergente + custo_mao_obra + depreciacao
 
 # ============================================================================
 # 📡 FUNÇÕES DE DADOS
@@ -312,44 +341,84 @@ def buscar_historico_thingspeak(data_inicio, data_fim):
         df_hist = df_hist.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
     return df_hist
 
-def analisar(df, potencia_w):
-    """Analisa os dados e calcula se compensa limpar"""
+def analisar(df, potencia_w, custo_limpeza):
+    """
+    Analisa os dados e decide se compensa limpar.
+
+    NOVA LÓGICA (integrada ao custo real de limpeza):
+      - A perda de energia de cada amostra é calculada usando o INTERVALO REAL de
+        tempo entre uma leitura e a anterior (não mais o antigo "× 48", que assumia
+        12 h de sol constante). Isso torna a perda em R$ defensável na banca.
+      - A DECISÃO é feita no nível do período: soma-se a perda em R$ de todas as
+        amostras, calcula-se a PERDA MÉDIA POR DIA e compara-se diretamente com o
+        CUSTO DA LIMPEZA (água + detergente + mão de obra + depreciação):
+
+              compensa_limpar  =  (perda_diaria  >=  custo_limpeza)
+
+        Ou seja: quando a placa perde por dia MAIS do que custa limpá-la, recomenda
+        limpar. Se perde menos, o sistema informa em quantos dias a sujeira
+        acumulada vai "pagar" a limpeza (payback).
+
+    Recebe o custo de limpeza já calculado (R$) para não recalcular a cada linha.
+    """
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    # Intervalo real (horas) entre cada leitura e a anterior.
+    # A 1ª leitura (e o caso de leitura única) assume 15 min = 0.25 h como padrão.
+    dt_h = df["timestamp"].diff().dt.total_seconds().div(3600)
+    dt_h = dt_h.bfill().fillna(0.25)
+
     rows = []
-    for _, row in df.iterrows():
-        irrad = row.get("irradiancia", 0)
-        ger_est = row.get("geracao_estimada", 0)
-        ger_prev = ger_est
-        ger_real = round((irrad / IRRADIANCIA_STC) * potencia_w * EFICIENCIA, 3)
+    for i, row in df.iterrows():
+        irrad    = row.get("irradiancia", 0)
+        ger_prev = row.get("geracao_estimada", 0)                       # W (previsto pela API)
+        ger_real = (irrad / IRRADIANCIA_STC) * potencia_w * EFICIENCIA  # W (teórico da placa)
 
-        # Calcular perda percentual
-        perda = max(0, round((ger_prev - ger_real) / ger_prev * 100, 2) if ger_prev > 0 else 0)
-        ind = perda > LIMIAR_SUJEIRA
+        # Perda percentual instantânea
+        perda_pct = max(0, (ger_prev - ger_real) / ger_prev * 100) if ger_prev > 0 else 0
+        ind = perda_pct > LIMIAR_SUJEIRA
 
-        # Perda financeira
-        p_fin = round((ger_prev - ger_real) * 0.25 / 1000 * TARIFA_KWH, 4)
-        p_dia = p_fin * 48
-        comp = ind and (p_dia > CUSTO_LIMPEZA)
-
-        # Mensagem de status
-        if not ind:
-            msg = "✅ Placa OK. Limpeza não necessária."
-        elif comp:
-            msg = f"🚨 Sujeira! Perda {perda:.1f}%. Perda diária R${p_dia:.2f}. COMPENSA LIMPAR."
-        else:
-            msg = f"⚠️ Sujeira ({perda:.1f}%). Perda R${p_dia:.2f} menor que limpeza R${CUSTO_LIMPEZA:.2f}. Aguardar."
+        # Energia perdida NESTA amostra (kWh), usando o intervalo REAL entre leituras:
+        #   potência_perdida(W) × tempo(h) / 1000 = energia(kWh)
+        e_perd_kwh = max(0, ger_prev - ger_real) * dt_h[i] / 1000.0
+        p_fin      = e_perd_kwh * TARIFA_KWH   # R$ perdidos nesta amostra
 
         rows.append({
             "geracao_prevista": ger_prev,
             "geracao_real": round(ger_real, 3),
-            "perda_percentual": perda,
+            "perda_percentual": round(perda_pct, 2),
             "indicativo_sujeira": ind,
-            "perda_financeira": p_fin,
-            "custo_limpeza": CUSTO_LIMPEZA,
-            "compensa_limpar": comp,
-            "mensagem_status": msg
+            "energia_perdida_kwh": e_perd_kwh,
+            "perda_financeira": round(p_fin, 4),
+            "custo_limpeza": round(custo_limpeza, 4),
         })
 
-    return pd.DataFrame(rows)
+    an = pd.DataFrame(rows)
+
+    # ---- DECISÃO no nível do PERÍODO: perda em R$ acumulada vs custo de limpeza ----
+    dias = max(1, (df["timestamp"].max() - df["timestamp"].min()).days + 1)
+    perda_acumulada = an["perda_financeira"].sum()      # R$ perdidos no período todo
+    perda_diaria    = perda_acumulada / dias            # R$/dia médio
+
+    compensa = bool(perda_diaria >= custo_limpeza) and bool(an["indicativo_sujeira"].any())
+    dias_payback = (custo_limpeza / perda_diaria) if perda_diaria > 0 else float("inf")
+
+    if not an["indicativo_sujeira"].any():
+        msg = "✅ Placa OK. Limpeza não necessária."
+    elif compensa:
+        msg = (f"🚨 Sujeira detectada. Perda ~R${perda_diaria:.2f}/dia ≥ "
+               f"custo de limpeza R${custo_limpeza:.2f}. COMPENSA LIMPAR.")
+    else:
+        payback_txt = f"{dias_payback:.1f} dias" if dias_payback != float("inf") else "—"
+        msg = (f"⚠️ Sujeira leve. Perda ~R${perda_diaria:.2f}/dia < "
+               f"custo R${custo_limpeza:.2f}. Aguardar (a sujeira paga a limpeza em ~{payback_txt}).")
+
+    # Valores de período replicados em todas as linhas (facilita ler an.iloc[-1])
+    an["compensa_limpar"]  = compensa
+    an["mensagem_status"]  = msg
+    an["perda_diaria_est"] = round(perda_diaria, 4)
+    an["dias_payback"]     = round(dias_payback, 2) if dias_payback != float("inf") else None
+    return an
 
 def card(titulo, valor, unidade="", cor="#f1f5f9"):
     """Exibe um card com métrica"""
@@ -805,6 +874,29 @@ def main():
 
         st.markdown("---")
 
+        # ============================================================================
+        # 💧 CUSTO DE LIMPEZA — insumos editáveis (água, detergente, mão de obra...)
+        # ============================================================================
+        st.subheader("💧 Custo de Limpeza")
+        st.caption("O custo é a **soma dos insumos**. Ajuste conforme sua realidade.")
+
+        with st.expander("Ajustar insumos da limpeza", expanded=False):
+            agua_litros    = st.number_input("Água por limpeza (L)", min_value=0.0, value=AGUA_LITROS_PADRAO, step=0.5)
+            agua_preco_m3  = st.number_input("Preço da água (R$/m³)", min_value=0.0, value=AGUA_PRECO_M3_PADRAO, step=0.5, format="%.2f")
+            det_ml         = st.number_input("Detergente por limpeza (ml)", min_value=0.0, value=DETERGENTE_ML_PADRAO, step=5.0)
+            det_preco_l    = st.number_input("Preço do detergente (R$/L)", min_value=0.0, value=DETERGENTE_PRECO_L_PADRAO, step=0.5, format="%.2f")
+            mo_min         = st.number_input("Tempo de mão de obra (min)", min_value=0.0, value=MAO_OBRA_MIN_PADRAO, step=1.0)
+            mo_hora        = st.number_input("Valor da mão de obra (R$/h)", min_value=0.0, value=MAO_OBRA_HORA_PADRAO, step=1.0, format="%.2f")
+            deprec         = st.number_input("Depreciação equip. (R$/limpeza)", min_value=0.0, value=DEPRECIACAO_PADRAO, step=0.05, format="%.2f")
+
+        # Custo total desta limpeza (R$), usado em toda a análise e decisão
+        custo_limpeza_atual = custo_total_limpeza(
+            agua_litros, agua_preco_m3, det_ml, det_preco_l, mo_min, mo_hora, deprec
+        )
+        card("Custo total da limpeza", f"R$ {custo_limpeza_atual:.2f}", "por limpeza", "#a78bfa")
+
+        st.markdown("---")
+
         # Filtro de período
         if not df.empty and "timestamp" in df.columns:
             st.subheader("📅 Período")
@@ -848,8 +940,8 @@ def main():
             st.warning("Nenhum dado para o período selecionado.")
             st.stop()
 
-        # Análise
-        an = analisar(df, potencia_cliente)
+        # Análise (usa o custo de limpeza calculado a partir dos insumos)
+        an = analisar(df, potencia_cliente, custo_limpeza_atual)
         ultima = df.iloc[-1]
         ult_an = an.iloc[-1]
 
@@ -859,15 +951,20 @@ def main():
 
         if ult_an["compensa_limpar"]:
             perda = ult_an["perda_percentual"]
-            perda_diaria = ult_an["perda_financeira"] * 48
-            msg_alerta = f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda detectada: {perda}%. Perda diária: R${perda_diaria:.2f}. COMPENSA LIMPAR!"
+            perda_diaria = ult_an["perda_diaria_est"]
+            msg_alerta = (f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda média: R${perda_diaria:.2f}/dia — "
+                          f"maior ou igual ao custo de limpeza (R${custo_limpeza_atual:.2f}). COMPENSA LIMPAR!")
             st.error(msg_alerta)
             verificar_e_enviar_alerta_email(True, msg_alerta)
         else:
             verificar_e_enviar_alerta_email(False, "")
 
         # Info box
-        st.info(f"Calculando para uma placa de {potencia_cliente:.0f}W — Geração máxima esperada: {potencia_cliente * EFICIENCIA:.1f}W em condições ideais")
+        st.info(
+            f"Calculando para uma placa de {potencia_cliente:.0f}W — Geração máxima esperada: "
+            f"{potencia_cliente * EFICIENCIA:.1f}W em condições ideais. "
+            f"Custo de limpeza considerado: R${custo_limpeza_atual:.2f}."
+        )
 
         # Diagnóstico atual
         st.subheader("Diagnóstico Atual")
@@ -895,11 +992,13 @@ def main():
         with c7:
             card("Perda/Medição", f"R$ {ult_an['perda_financeira']:.4f}", "", "#f87171")
         with c8:
-            card("Perda Diária", f"R$ {ult_an['perda_financeira']*48:.2f}", "estimada", "#fb923c")
+            card("Perda Diária", f"R$ {ult_an['perda_diaria_est']:.2f}", "média/dia", "#fb923c")
         with c9:
-            card("Custo Limpeza", f"R$ {CUSTO_LIMPEZA:.2f}", "", "#a78bfa")
+            card("Custo Limpeza", f"R$ {custo_limpeza_atual:.2f}", "insumos", "#a78bfa")
         with c10:
-            card("Registros", f"{len(df)}", "no período", "#67e8f9")
+            payback = ult_an["dias_payback"]
+            payback_txt = f"{payback:.1f}" if payback is not None else "—"
+            card("Paga limpeza em", payback_txt, "dias", "#67e8f9")
 
         st.markdown("---")
 
@@ -979,17 +1078,20 @@ def main():
 
         # Análise econômica
         st.subheader("Análise Econômica do Período")
-        perda_kwh = ((an["geracao_prevista"] - an["geracao_real"]) * 0.25 / 1000).sum()
-        perda_r = an["perda_financeira"].sum()
+        perda_kwh = an["energia_perdida_kwh"].sum()   # energia perdida real (kWh), intervalo real
+        perda_r   = an["perda_financeira"].sum()       # R$ perdidos no período
+        perda_dia = ult_an["perda_diaria_est"]         # R$/dia médio
         e1, e2, e3, e4 = st.columns(4)
         with e1:
-            card("Energia Perdida", f"{perda_kwh:.4f}", "kWh")
+            card("Energia Perdida", f"{perda_kwh:.4f}", "kWh no período")
         with e2:
             card("Perda Total", f"R$ {perda_r:.3f}", "no período")
         with e3:
-            card("Alertas Sujeira", f"{int(an['indicativo_sujeira'].sum())}", "leituras")
+            card("Perda Média", f"R$ {perda_dia:.2f}", "por dia")
         with e4:
-            card("Limpezas Recom.", f"{int(an['compensa_limpar'].sum())}", "ocorrências")
+            decisao = "SIM" if ult_an["compensa_limpar"] else "NÃO"
+            cor_dec = "#ef4444" if ult_an["compensa_limpar"] else "#22c55e"
+            card("Compensa Limpar?", decisao, f"custo R$ {custo_limpeza_atual:.2f}", cor_dec)
 
         st.markdown("---")
 
