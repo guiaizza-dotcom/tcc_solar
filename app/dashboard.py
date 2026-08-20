@@ -849,6 +849,13 @@ def main():
     # Cabeçalho
     st.markdown('<h1 style="margin:0">☀️ Monitor de Placas Fotovoltaicas</h1>', unsafe_allow_html=True)
     st.markdown("**Sistema inteligente de detecção de sujeira e análise de viabilidade econômica**")
+    # 🟢 SELO DE VERSÃO — se você NÃO vê este selo no app, ele está rodando um arquivo ANTIGO.
+    st.markdown(
+        '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
+        'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
+        'margin:6px 0">🟢 versão 2.0 — custo por insumos + fundo verde</div>',
+        unsafe_allow_html=True,
+    )
     st.markdown("---")
 
     # Carregar dados
