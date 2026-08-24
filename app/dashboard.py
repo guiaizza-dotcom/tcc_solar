@@ -73,6 +73,13 @@ THINGSPEAK_CHANNEL_ID = "3337625"
 THINGSPEAK_READ_API_KEY = "I7LHJFAFLIN4J5HJ"
 THINGSPEAK_FIELD_IRRADIANCIA = 7  # Field 7 = Irradiação
 
+# --- ThingSpeak (Canal "TCC" — Radiação Solar Estimada via Open-Meteo) ---
+# Canal separado que grava a previsão da API do Open-Meteo, para comparar com o
+# sensor real de irradiância do canal acima (field7).
+THINGSPEAK_CHANNEL_ID_METEO = "3426951"
+THINGSPEAK_READ_API_KEY_METEO = "NHG9H2BKG2NR1M3N"
+THINGSPEAK_FIELD_RADIACAO_ESTIMADA = 1  # Field 1 = Radiação Solar Estimada (Open-Meteo)
+
 # ============================================================================
 # 🎨 ESTILOS CSS
 # ============================================================================
@@ -280,12 +287,22 @@ THINGSPEAK_CAMPOS = {
     "field8": {"nome": "Temperatura Externa", "unidade": "°C", "cor": "#a78bfa"},
 }
 
+# Nomes amigáveis dos fields do canal "TCC" (Open-Meteo), conforme os widgets
+# já criados no ThingSpeak: Field 1 = Radiação Solar Estimada, Field 2 = Umidade
+# do Ar, Field 3 = Previsão de Chuva.
+THINGSPEAK_CAMPOS_METEO = {
+    "field1": {"nome": "Radiação Solar Estimada", "unidade": "W/m²", "cor": "#38bdf8"},
+    "field2": {"nome": "Umidade do Ar (prevista)", "unidade": "%", "cor": "#818cf8"},
+    "field3": {"nome": "Previsão de Chuva", "unidade": "%", "cor": "#94a3b8"},
+}
+
 def agora_brasil():
     """Retorna o datetime atual no horário de Brasília (UTC-3), não importa o fuso do servidor."""
     return datetime.utcnow() - pd.Timedelta(hours=3)
 
 @st.cache_data(ttl=60)
-def buscar_historico_thingspeak(data_inicio, data_fim):
+def buscar_historico_thingspeak(data_inicio, data_fim, channel_id=THINGSPEAK_CHANNEL_ID,
+                                 api_key=THINGSPEAK_READ_API_KEY, campos=None):
     """
     Busca o histórico do ThingSpeak entre duas datas (inclusive), já no horário de
     Brasília (UTC-3). O ThingSpeak grava tudo em UTC, então:
@@ -294,8 +311,14 @@ def buscar_historico_thingspeak(data_inicio, data_fim):
     Sem isso, uma leitura feita às 22h de um dia no Brasil chega marcada como
     01h do dia seguinte em UTC — e "hoje" na tela virava "amanhã".
     Pagina automaticamente porque o ThingSpeak limita 8000 registros por chamada.
+
+    Aceita canal/API key/campos como parâmetros para poder reaproveitar esta mesma
+    função com QUALQUER canal do ThingSpeak — por padrão usa o canal da Minha Placa
+    (sensores), mas também é usada para buscar o canal "TCC" com a previsão do
+    Open-Meteo (veja THINGSPEAK_CHANNEL_ID_METEO / THINGSPEAK_CAMPOS_METEO).
     """
-    url = f"https://api.thingspeak.com/channels/{THINGSPEAK_CHANNEL_ID}/feeds.json"
+    campos = campos or THINGSPEAK_CAMPOS
+    url = f"https://api.thingspeak.com/channels/{channel_id}/feeds.json"
     todos_registros = []
 
     # Período pedido é local (Brasil) -> converte para UTC para consultar a API
@@ -305,7 +328,7 @@ def buscar_historico_thingspeak(data_inicio, data_fim):
 
     while inicio_atual <= fim_utc:
         params = {
-            "api_key": THINGSPEAK_READ_API_KEY,
+            "api_key": api_key,
             "start": inicio_atual.strftime("%Y-%m-%d %H:%M:%S"),
             "end": fim_utc.strftime("%Y-%m-%d %H:%M:%S"),
             "results": 8000,
@@ -315,7 +338,7 @@ def buscar_historico_thingspeak(data_inicio, data_fim):
             resp.raise_for_status()
             feeds = resp.json().get("feeds", [])
         except Exception as e:
-            st.error(f"Erro ao buscar histórico do ThingSpeak: {e}")
+            st.error(f"Erro ao buscar histórico do ThingSpeak (canal {channel_id}): {e}")
             break
 
         if not feeds:
@@ -325,7 +348,7 @@ def buscar_historico_thingspeak(data_inicio, data_fim):
             ts_utc = pd.to_datetime(f.get("created_at"), utc=True)
             ts_local = ts_utc.tz_convert(None) - pd.Timedelta(hours=3) if pd.notna(ts_utc) else pd.NaT
             registro = {"timestamp": ts_local}
-            for campo in THINGSPEAK_CAMPOS:
+            for campo in campos:
                 registro[campo] = pd.to_numeric(f.get(campo), errors="coerce")
             todos_registros.append(registro)
 
@@ -340,6 +363,51 @@ def buscar_historico_thingspeak(data_inicio, data_fim):
     if not df_hist.empty:
         df_hist = df_hist.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
     return df_hist
+
+
+@st.cache_data(ttl=60)
+def buscar_comparacao_irradiancia(data_inicio, data_fim):
+    """
+    Junta, para o mesmo período, a irradiância REAL medida pelo sensor (canal
+    THINGSPEAK_CHANNEL_ID, field7) com a irradiância ESTIMADA pelo Open-Meteo
+    (canal THINGSPEAK_CHANNEL_ID_METEO, field1 = "Radiação Solar Estimada").
+
+    Os dois canais não gravam exatamente no mesmo instante, então usamos
+    merge_asof para casar cada leitura do sensor com a leitura de previsão mais
+    próxima no tempo (tolerância de 15 min — além disso não casa).
+    """
+    df_sensor = buscar_historico_thingspeak(data_inicio, data_fim)
+    df_meteo = buscar_historico_thingspeak(
+        data_inicio, data_fim,
+        channel_id=THINGSPEAK_CHANNEL_ID_METEO,
+        api_key=THINGSPEAK_READ_API_KEY_METEO,
+        campos=THINGSPEAK_CAMPOS_METEO,
+    )
+
+    if df_sensor.empty or df_meteo.empty:
+        return pd.DataFrame()
+
+    sensor = (
+        df_sensor[["timestamp", "field7"]]
+        .rename(columns={"field7": "irradiancia_sensor"})
+        .dropna(subset=["irradiancia_sensor"])
+        .sort_values("timestamp")
+    )
+    meteo = (
+        df_meteo[["timestamp", "field1", "field2", "field3"]]
+        .rename(columns={
+            "field1": "irradiancia_estimada",
+            "field2": "umidade_estimada",
+            "field3": "chuva_estimada",
+        })
+        .sort_values("timestamp")
+    )
+
+    comp = pd.merge_asof(
+        sensor, meteo, on="timestamp", direction="nearest",
+        tolerance=pd.Timedelta("15min"),
+    )
+    return comp.dropna(subset=["irradiancia_estimada"]).reset_index(drop=True)
 
 def analisar(df, potencia_w, custo_limpeza):
     """
@@ -750,6 +818,74 @@ def render_placa_ao_vivo():
     ))
     fig_pot.update_layout(**LAY, title="Potência (W)", yaxis_title="W")
     st.plotly_chart(fig_pot, use_container_width=True)
+
+    st.markdown("---")
+
+    # ============================================================================
+    # 🛰️ COMPARAÇÃO: SENSOR DE IRRADIÂNCIA (real) vs OPEN-METEO (previsto)
+    # ============================================================================
+    st.subheader("🛰️ Irradiância: Sensor Real vs Previsão (Open-Meteo)")
+    st.caption(
+        "Mesma ideia da comparação Placa Suja vs Placa Limpa, mas aqui comparando o "
+        "sensor de irradiância (canal ThingSpeak da placa) com a radiação solar "
+        "estimada pela API do Open-Meteo (canal ThingSpeak separado) — ajuda a "
+        "validar se o sensor está calibrado e se a previsão bate com a realidade."
+    )
+
+    with st.spinner("Buscando dados do canal Open-Meteo..."):
+        df_comp = buscar_comparacao_irradiancia(data_inicio, data_fim)
+
+    if df_comp.empty:
+        st.warning(
+            "⚠️ Sem dados suficientes para comparar sensor e previsão nesse período "
+            "(confira se o canal 'TCC' (Open-Meteo) tem leituras nesse intervalo)."
+        )
+    else:
+        ultima_comp = df_comp.iloc[-1]
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            card("Sensor (real)", f"{ultima_comp['irradiancia_sensor']:.0f}", "W/m²", "#facc15")
+        with cc2:
+            card("Open-Meteo (previsto)", f"{ultima_comp['irradiancia_estimada']:.0f}", "W/m²", "#38bdf8")
+        with cc3:
+            estimada = ultima_comp["irradiancia_estimada"]
+            diff = ultima_comp["irradiancia_sensor"] - estimada
+            diff_pct = (diff / estimada * 100) if estimada else 0
+            cor_diff = "#22c55e" if abs(diff_pct) <= 10 else "#ef4444"
+            card("Diferença", f"{diff:+.0f} W/m² ({diff_pct:+.1f}%)", "sensor − previsto", cor_diff)
+
+        fig_comp = go.Figure()
+        fig_comp.add_trace(go.Scatter(
+            x=df_comp["timestamp"], y=df_comp["irradiancia_sensor"],
+            name="Sensor (real)", mode="lines", line=dict(color="#facc15", width=2)
+        ))
+        fig_comp.add_trace(go.Scatter(
+            x=df_comp["timestamp"], y=df_comp["irradiancia_estimada"],
+            name="Open-Meteo (previsto)", mode="lines",
+            line=dict(color="#38bdf8", width=2, dash="dash")
+        ))
+        fig_comp.add_trace(go.Scatter(
+            x=pd.concat([df_comp["timestamp"], df_comp["timestamp"][::-1]]),
+            y=pd.concat([df_comp["irradiancia_sensor"], df_comp["irradiancia_estimada"][::-1]]),
+            fill="toself", fillcolor="rgba(56,189,248,0.12)",
+            line=dict(color="rgba(0,0,0,0)"),
+            name="Diferença", hoverinfo="skip"
+        ))
+        fig_comp.update_layout(**LAY, title="Irradiância: Sensor vs Open-Meteo (W/m²)", yaxis_title="W/m²")
+        st.plotly_chart(fig_comp, use_container_width=True)
+
+        with st.expander("📋 Ver dados da comparação Sensor x Open-Meteo"):
+            st.dataframe(
+                df_comp.rename(columns={
+                    "irradiancia_sensor": "Sensor (W/m²)",
+                    "irradiancia_estimada": "Open-Meteo (W/m²)",
+                    "umidade_estimada": "Umidade prevista (%)",
+                    "chuva_estimada": "Chance de chuva (%)",
+                }).sort_values("timestamp", ascending=False),
+                use_container_width=True, hide_index=True,
+            )
+
+    st.markdown("---")
 
     # Um gráfico de histórico para cada field, dois por linha — mesmo período, escala única
     st.subheader("Histórico por Sensor")
