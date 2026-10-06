@@ -978,6 +978,217 @@ def render_placa_ao_vivo():
             )
 
 # ============================================================================
+# ⚖️ ABA: COMPARAÇÃO — PLACA LIMPA (esquerda) x PLACA SUJA (direita)
+# ============================================================================
+
+# Fields de cada placa no canal ThingSpeak (conforme THINGSPEAK_CAMPOS)
+PLACA_LIMPA = {"nome": "Placa Limpa", "emoji": "🟢", "cor": "#22c55e",
+               "potencia": "field4", "tensao": "field5", "temperatura": "field6"}
+PLACA_SUJA  = {"nome": "Placa Suja",  "emoji": "🟠", "cor": "#f59e0b",
+               "potencia": "field1", "tensao": "field2", "temperatura": "field3"}
+
+# Abaixo dessa potência na placa limpa (noite/amanhecer) a razão Suja/Limpa vira ruído
+POT_MIN_RAZAO = 0.5  # W
+
+def energia_periodo_wh(df, campo_pot):
+    """
+    Integra a potência no tempo (W × h = Wh) usando o intervalo REAL entre leituras.
+    Intervalos maiores que 30 min (falha de envio / ESP32 desligado) são limitados
+    a 30 min para não inflar a energia calculada.
+    """
+    d = df[["timestamp", campo_pot]].dropna().sort_values("timestamp")
+    if len(d) < 2:
+        return 0.0
+    dt_h = d["timestamp"].diff().dt.total_seconds().div(3600).fillna(0).clip(upper=0.5)
+    return float((d[campo_pot].clip(lower=0) * dt_h).sum())
+
+def _faixa_comum(df, campos, comecar_no_zero=False):
+    """Calcula a mesma faixa do eixo Y para as duas placas, para a comparação
+    visual lado a lado ser justa (mesma escala nos dois gráficos)."""
+    valores = pd.concat([df[c] for c in campos]).dropna()
+    if valores.empty:
+        return None
+    lo, hi = float(valores.min()), float(valores.max())
+    margem = (hi - lo) * 0.08 or 1.0
+    inferior = 0 if (comecar_no_zero and lo >= 0) else lo - margem
+    return [inferior, hi + margem]
+
+def _coluna_placa(df, ultima, placa, faixas, sufixo):
+    """Desenha uma coluna completa (cards + gráficos) para UMA placa."""
+    cor = placa["cor"]
+
+    # Cabeçalho da coluna
+    st.markdown(
+        f'<div class="card" style="border:2px solid {cor};padding:12px 14px">'
+        f'<div class="card-value" style="color:{cor};font-size:22px">'
+        f'{placa["emoji"]} {placa["nome"]}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    grandezas = [
+        ("potencia", "Potência", "W"),
+        ("tensao", "Tensão", "V"),
+        ("temperatura", "Temperatura", "°C"),
+    ]
+
+    # Valores atuais
+    cols = st.columns(3)
+    for col, (chave, rotulo, unid) in zip(cols, grandezas):
+        with col:
+            v = ultima.get(placa[chave])
+            card(f"{rotulo} atual", f"{v:.1f}" if pd.notna(v) else "—", unid, cor)
+
+    # Resumo do período
+    pot = df[placa["potencia"]]
+    tem_pot = pot.notna().any()
+    energia = energia_periodo_wh(df, placa["potencia"])
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        card("Potência média", f"{pot.mean():.2f}" if tem_pot else "—", "W", cor)
+    with s2:
+        card("Pico de potência", f"{pot.max():.2f}" if tem_pot else "—", "W", cor)
+    with s3:
+        card("Energia gerada", f"{energia:.2f}", "Wh no período", cor)
+
+    # Gráficos (mesma escala Y que a outra coluna)
+    for chave, rotulo, unid in grandezas:
+        fig = go.Figure(go.Scatter(
+            x=df["timestamp"], y=df[placa[chave]],
+            fill="tozeroy", fillcolor=hex_para_rgba(cor, 0.15),
+            line=dict(color=cor, width=2), name=rotulo,
+        ))
+        fig.update_layout(**LAY, title=f"{rotulo} ({unid})", yaxis_title=unid, height=280)
+        if faixas.get(chave):
+            fig.update_yaxes(range=faixas[chave])
+        st.plotly_chart(fig, use_container_width=True, key=f"cmp_{chave}_{sufixo}")
+
+def render_comparacao():
+    """Aba que separa as duas placas: placa LIMPA à esquerda e placa SUJA à direita."""
+    st.subheader("⚖️ Comparação — Placa Limpa x Placa Suja")
+
+    # 📅 Período (independente da aba "Minha Placa ao Vivo")
+    hoje = agora_brasil().date()
+    if "cmp_data_inicio" not in st.session_state:
+        st.session_state["cmp_data_inicio"] = hoje
+    if "cmp_data_fim" not in st.session_state:
+        st.session_state["cmp_data_fim"] = hoje
+
+    def _definir_periodo_hoje_cmp():
+        d = agora_brasil().date()
+        st.session_state["cmp_data_inicio"] = d
+        st.session_state["cmp_data_fim"] = d
+
+    col_p1, col_p2, col_p3, col_p4 = st.columns([1, 1, 1, 1])
+    with col_p1:
+        data_inicio = st.date_input("De:", key="cmp_data_inicio")
+    with col_p2:
+        data_fim = st.date_input("Até:", key="cmp_data_fim")
+    with col_p3:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        st.button("📆 Só hoje", use_container_width=True, key="btn_cmp_hoje", on_click=_definir_periodo_hoje_cmp)
+    with col_p4:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        if st.button("🔄 Atualizar", use_container_width=True, key="btn_cmp_atualizar"):
+            st.cache_data.clear()
+            st.rerun()
+
+    if data_inicio > data_fim:
+        st.error("A data 'De' não pode ser depois da data 'Até'.")
+        return
+
+    with st.spinner("Buscando dados do ThingSpeak..."):
+        df_ts = buscar_historico_thingspeak(data_inicio, data_fim)
+
+    if df_ts.empty:
+        st.warning("⚠️ Sem dados no ThingSpeak para o período selecionado.")
+        return
+
+    ultima = df_ts.iloc[-1]
+    st.caption(
+        f"Período: {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')} "
+        f"— {len(df_ts)} leituras — última: {ultima['timestamp'].strftime('%d/%m/%Y %H:%M:%S')} (horário de Brasília)"
+    )
+
+    # 🌤️ Condições comuns às duas placas (mesmo sol, mesmo ambiente)
+    a1, a2 = st.columns(2)
+    with a1:
+        v = ultima.get("field7")
+        card("Irradiação (comum às duas)", f"{v:.0f}" if pd.notna(v) else "—", "W/m²", "#facc15")
+    with a2:
+        v = ultima.get("field8")
+        card("Temperatura Externa", f"{v:.1f}" if pd.notna(v) else "—", "°C", "#a78bfa")
+
+    st.markdown("---")
+
+    # Mesma escala Y nos dois lados
+    faixas = {
+        "potencia":    _faixa_comum(df_ts, [PLACA_LIMPA["potencia"], PLACA_SUJA["potencia"]], comecar_no_zero=True),
+        "tensao":      _faixa_comum(df_ts, [PLACA_LIMPA["tensao"], PLACA_SUJA["tensao"]], comecar_no_zero=True),
+        "temperatura": _faixa_comum(df_ts, [PLACA_LIMPA["temperatura"], PLACA_SUJA["temperatura"]]),
+    }
+
+    # ⬅️ LIMPA | SUJA ➡️
+    col_esq, col_dir = st.columns(2, gap="large")
+    with col_esq:
+        _coluna_placa(df_ts, ultima, PLACA_LIMPA, faixas, "limpa")
+    with col_dir:
+        _coluna_placa(df_ts, ultima, PLACA_SUJA, faixas, "suja")
+
+    st.markdown("---")
+
+    # 📉 Perda por sujeira — razão P_suja / P_limpa
+    st.subheader("📉 Perda por Sujeira — razão P_suja / P_limpa")
+    st.caption(
+        "As duas placas recebem o mesmo sol, então a razão entre as potências mede "
+        "diretamente a perda causada pela sujeira, sem depender da calibração do "
+        f"sensor de irradiância. Leituras com placa limpa abaixo de {POT_MIN_RAZAO} W "
+        "(noite/amanhecer) são ignoradas."
+    )
+
+    d = df_ts[["timestamp", PLACA_SUJA["potencia"], PLACA_LIMPA["potencia"]]].dropna()
+    d = d[d[PLACA_LIMPA["potencia"]] > POT_MIN_RAZAO].copy()
+
+    if d.empty:
+        st.info("Sem leituras com sol suficiente no período para calcular a razão.")
+        return
+
+    d["razao"] = d[PLACA_SUJA["potencia"]] / d[PLACA_LIMPA["potencia"]]
+    d["perda_pct"] = (1 - d["razao"]) * 100
+
+    e_limpa = energia_periodo_wh(df_ts, PLACA_LIMPA["potencia"])
+    e_suja = energia_periodo_wh(df_ts, PLACA_SUJA["potencia"])
+    perda_energia_pct = (1 - e_suja / e_limpa) * 100 if e_limpa > 0 else None
+
+    perda_atual = d["perda_pct"].iloc[-1]
+    cor_atual = "#ef4444" if perda_atual > LIMIAR_SUJEIRA else "#22c55e"
+
+    r1, r2, r3, r4 = st.columns(4)
+    with r1:
+        card("Razão atual", f"{d['razao'].iloc[-1]:.2f}", "P_suja / P_limpa", "#67e8f9")
+    with r2:
+        card("Perda atual", f"{perda_atual:.1f}", "%", cor_atual)
+    with r3:
+        if perda_energia_pct is not None:
+            cor_p = "#ef4444" if perda_energia_pct > LIMIAR_SUJEIRA else "#22c55e"
+            card("Perda no período", f"{perda_energia_pct:.1f}", "% da energia", cor_p)
+        else:
+            card("Perda no período", "—", "% da energia")
+    with r4:
+        card("Energia perdida", f"{max(0, e_limpa - e_suja):.2f}", "Wh no período", "#f87171")
+
+    fig_r = go.Figure(go.Scatter(
+        x=d["timestamp"], y=d["perda_pct"], mode="lines",
+        line=dict(color="#f87171", width=2), name="Perda (%)",
+    ))
+    fig_r.add_hline(
+        y=LIMIAR_SUJEIRA, line_dash="dash", line_color="#facc15",
+        annotation_text=f"Limiar ({LIMIAR_SUJEIRA}%)",
+        annotation_position="top right", annotation_font_color="#facc15",
+    )
+    fig_r.update_layout(**LAY, title="Perda da placa suja em relação à limpa (%)", yaxis_title="%")
+    st.plotly_chart(fig_r, use_container_width=True, key="cmp_razao")
+
+# ============================================================================
 # 🎯 FUNÇÃO PRINCIPAL
 # ============================================================================
 
@@ -989,7 +1200,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 2.0 — custo por insumos + fundo verde</div>',
+        'margin:6px 0">🟢 versão 2.1 — aba Comparação (limpa x suja)</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
@@ -1061,10 +1272,15 @@ def main():
     # 🧪 BOTÃO DE TESTE DE NOTIFICAÇÃO
     mostrar_botao_teste_notificacao()
 
-    tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "☀️ Minha Placa ao Vivo", "📧 E-mail"])
+    tab1, tab2, tab_cmp, tab3 = st.tabs(
+        ["📊 Dashboard", "☀️ Minha Placa ao Vivo", "⚖️ Comparação", "📧 E-mail"]
+    )
 
     with tab2:
         render_placa_ao_vivo()
+
+    with tab_cmp:
+        render_comparacao()
 
     with tab3:
         render_aba_email()
