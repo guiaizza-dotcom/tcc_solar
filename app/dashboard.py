@@ -222,6 +222,39 @@ def carregar_emails_alerta():
     except Exception:
         return []
 
+def _abrir_planilha():
+    """Abre a 1ª aba da planilha do Google Sheets com a service account."""
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    if "gcp_service_account" in st.secrets:
+        creds = Credentials.from_service_account_info(
+            dict(st.secrets["gcp_service_account"]), scopes=scopes)
+    else:
+        creds = Credentials.from_service_account_file(CRED_FILE, scopes=scopes)
+    return gspread.authorize(creds).open_by_key(SHEET_ID).sheet1
+
+def gravar_ultima_limpeza(data_hora):
+    """Grava a data/hora (horário de Brasília) da última limpeza na planilha
+    (célula J2). Fica salva entre sessões e reinicializações do app."""
+    try:
+        _abrir_planilha().update("J2", [[data_hora.strftime("%Y-%m-%d %H:%M:%S")]])
+        return True
+    except Exception as e:
+        st.error(f"Erro ao gravar a data da limpeza na planilha: {e}")
+        return False
+
+@st.cache_data(ttl=30)
+def carregar_ultima_limpeza():
+    """Lê a data/hora da última limpeza (célula J2). Retorna None se ainda não
+    houver nenhuma limpeza registrada ou em caso de erro."""
+    try:
+        valor = _abrir_planilha().acell("J2").value
+        if not valor or not str(valor).strip():
+            return None
+        ts = pd.to_datetime(str(valor).strip(), errors="coerce")
+        return None if pd.isna(ts) else ts.to_pydatetime()
+    except Exception:
+        return None
+
 @st.cache_data(ttl=60)
 def carregar_sheets():
     """Carrega dados da planilha Google Sheets"""
@@ -1048,9 +1081,104 @@ def _coluna_placa(df, ultima, placa, faixas, sufixo):
             fig.update_yaxes(range=faixas[chave])
         st.plotly_chart(fig, use_container_width=True, key=f"cmp_{chave}_{sufixo}")
 
-def render_comparacao():
+def _secao_perda_acumulada(custo_limpeza):
+    """
+    Contador de perda causada pela sujeira, acumulado desde a ÚLTIMA LIMPEZA.
+
+    A placa limpa é a referência (mesmo sol, mesmo ambiente). A cada leitura,
+    a potência que a placa suja deixou de gerar é (P_limpa − P_suja), e ela é
+    multiplicada pelo intervalo real até a leitura anterior (Wh). Somando tudo
+    desde a limpeza, temos a energia perdida acumulada — que cresce conforme a
+    sujeira se acumula e ZERA quando uma nova limpeza é registrada.
+    """
+    st.subheader("🧽 Perda acumulada desde a última limpeza")
+
+    agora = agora_brasil()
+    ultima_limpeza = carregar_ultima_limpeza()
+
+    cb1, cb2 = st.columns([1, 2])
+    with cb1:
+        if st.button("🧽 Registrar limpeza agora (zerar)", use_container_width=True, key="btn_limpeza_agora"):
+            if gravar_ultima_limpeza(agora_brasil()):
+                st.cache_data.clear()
+                st.rerun()
+    with cb2:
+        with st.expander("Limpei em outro horário — registrar data/hora manualmente"):
+            data_l = st.date_input("Data da limpeza", value=agora.date(), max_value=agora.date(), key="limpeza_data")
+            hora_l = st.time_input("Hora da limpeza", value=agora.time().replace(second=0, microsecond=0), key="limpeza_hora")
+            if st.button("Salvar data da limpeza", key="btn_limpeza_manual"):
+                if gravar_ultima_limpeza(datetime.combine(data_l, hora_l)):
+                    st.cache_data.clear()
+                    st.rerun()
+
+    if ultima_limpeza is None:
+        st.info("Nenhuma limpeza registrada ainda. Clique em **Registrar limpeza agora** "
+                "logo depois de limpar a placa para começar a contagem.")
+        return
+
+    dias = max(0.0, (agora - ultima_limpeza).total_seconds() / 86400)
+    st.caption(f"Última limpeza: {ultima_limpeza.strftime('%d/%m/%Y %H:%M')} (horário de Brasília) — há {dias:.1f} dia(s)")
+
+    with st.spinner("Calculando perda desde a última limpeza..."):
+        df = buscar_historico_thingspeak(ultima_limpeza.date(), agora.date())
+
+    f_l, f_s = PLACA_LIMPA["potencia"], PLACA_SUJA["potencia"]
+    if not df.empty:
+        df = df[df["timestamp"] >= ultima_limpeza][["timestamp", f_l, f_s]].dropna().sort_values("timestamp")
+
+    if df.empty or len(df) < 2:
+        st.info("Ainda não há leituras suficientes desde a última limpeza. O contador começa a subir com as próximas leituras.")
+        return
+
+    # Mesmo critério de energia_periodo_wh: intervalo real, limitado a 30 min
+    dt_h = df["timestamp"].diff().dt.total_seconds().div(3600).fillna(0).clip(upper=0.5)
+    p_limpa = df[f_l].clip(lower=0)
+    p_suja = df[f_s].clip(lower=0)
+    df["perda_wh_acum"] = ((p_limpa - p_suja).clip(lower=0) * dt_h).cumsum()
+
+    e_limpa = float((p_limpa * dt_h).sum())
+    perda_wh = float(df["perda_wh_acum"].iloc[-1])
+    perda_pct = perda_wh / e_limpa * 100 if e_limpa > 0 else 0.0
+    perda_rs = perda_wh / 1000.0 * TARIFA_KWH
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        card("Desde a limpeza", f"{dias:.1f}", "dias", "#67e8f9")
+    with k2:
+        card("Energia perdida acumulada", f"{perda_wh:.2f}", "Wh", "#f87171")
+    with k3:
+        cor_pct = "#ef4444" if perda_pct > LIMIAR_SUJEIRA else "#22c55e"
+        card("Perda acumulada", f"{perda_pct:.1f}", "% da energia da placa limpa", cor_pct)
+    with k4:
+        card("Perda em R$", f"R$ {perda_rs:.4f}", f"custo da limpeza R$ {custo_limpeza:.2f}", "#fb923c")
+
+    if custo_limpeza > 0:
+        if perda_rs >= custo_limpeza:
+            st.markdown(
+                f'<div class="decision-box alert">🚨 A perda acumulada (R$ {perda_rs:.4f}) já superou '
+                f'o custo da limpeza (R$ {custo_limpeza:.2f}). Compensa limpar.</div>',
+                unsafe_allow_html=True)
+        else:
+            st.markdown(
+                f'<div class="decision-box ok">✅ Perda acumulada R$ {perda_rs:.4f} — '
+                f'{perda_rs / custo_limpeza * 100:.1f}% do custo da limpeza (R$ {custo_limpeza:.2f}).</div>',
+                unsafe_allow_html=True)
+
+    fig_acum = go.Figure(go.Scatter(
+        x=df["timestamp"], y=df["perda_wh_acum"],
+        fill="tozeroy", fillcolor="rgba(248,113,113,0.15)",
+        line=dict(color="#f87171", width=2), name="Perda acumulada",
+    ))
+    fig_acum.update_layout(**LAY, title="Energia perdida acumulada desde a última limpeza (Wh)", yaxis_title="Wh", height=300)
+    st.plotly_chart(fig_acum, use_container_width=True, key="cmp_perda_acum")
+
+def render_comparacao(custo_limpeza):
     """Aba que separa as duas placas: placa LIMPA à esquerda e placa SUJA à direita."""
     st.subheader("⚖️ Comparação — Placa Limpa x Placa Suja")
+
+    # 🧽 Contador de perda desde a última limpeza (independe do período abaixo)
+    _secao_perda_acumulada(custo_limpeza)
+    st.markdown("---")
 
     # 📅 Período (independente da aba "Minha Placa ao Vivo")
     hoje = agora_brasil().date()
@@ -1186,7 +1314,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 2.2 — custo de limpeza só com água</div>',
+        'margin:6px 0">🟢 versão 2.3 — perda acumulada desde a limpeza</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
@@ -1259,7 +1387,7 @@ def main():
         render_placa_ao_vivo()
 
     with tab_cmp:
-        render_comparacao()
+        render_comparacao(custo_limpeza_atual)
 
     with tab3:
         render_aba_email()
