@@ -58,15 +58,9 @@ LIMIAR_SUJEIRA = 10.0
 EMAIL_ALERTA_PADRAO = "bittoleoguio@gmail.com"  # usado só se a planilha ainda não tiver e-mail salvo
 
 # --- 💧 Parâmetros de CUSTO DE LIMPEZA (valores padrão; editáveis na barra lateral) ---
-# O custo total deixa de ser um número fixo e passa a ser a SOMA dos insumos reais:
-# água + detergente + mão de obra + depreciação de equipamento (rodo/escova).
+# O custo da limpeza considera apenas a ÁGUA utilizada (litros × preço do m³).
 AGUA_LITROS_PADRAO        = 5.0    # litros de água por limpeza
 AGUA_PRECO_M3_PADRAO      = 5.50   # R$ por m³ (veja na sua conta de água/saneamento)
-DETERGENTE_ML_PADRAO      = 20.0   # ml de detergente por limpeza
-DETERGENTE_PRECO_L_PADRAO = 8.00   # R$ por litro do detergente
-MAO_OBRA_MIN_PADRAO       = 10.0   # minutos gastos por limpeza
-MAO_OBRA_HORA_PADRAO      = 0.0    # R$/h da mão de obra (0 se você mesmo limpa)
-DEPRECIACAO_PADRAO        = 0.10   # R$ por limpeza (desgaste de rodo/escova amortizado)
 
 # --- ThingSpeak (Minha Placa ao Vivo) ---
 THINGSPEAK_CHANNEL_ID = "3337625"
@@ -155,23 +149,15 @@ hr{ border-color:rgba(30,96,145,.5)!important; }
 </style>""", unsafe_allow_html=True)
 
 # ============================================================================
-# 💧 CUSTO DE LIMPEZA — calculado a partir dos insumos reais
+# 💧 CUSTO DE LIMPEZA — calculado a partir da água utilizada
 # ============================================================================
 
-def custo_total_limpeza(agua_litros, agua_preco_m3, detergente_ml, detergente_preco_l,
-                        mao_obra_min, mao_obra_hora, depreciacao):
+def custo_total_limpeza(agua_litros, agua_preco_m3):
     """
-    Soma o custo REAL de uma limpeza a partir dos insumos, em R$:
-      - água:      (litros / 1000) m³ × preço do m³
-      - detergente:(ml / 1000) L    × preço do litro
-      - mão de obra:(minutos / 60) h × valor da hora
-      - depreciação de equipamento: valor fixo por limpeza
-    Retorna o custo total de UMA limpeza (R$).
+    Custo de UMA limpeza (R$), considerando apenas a água:
+      (litros / 1000) m³ × preço do m³
     """
-    custo_agua       = (agua_litros / 1000.0) * agua_preco_m3
-    custo_detergente = (detergente_ml / 1000.0) * detergente_preco_l
-    custo_mao_obra   = (mao_obra_min / 60.0) * mao_obra_hora
-    return custo_agua + custo_detergente + custo_mao_obra + depreciacao
+    return (agua_litros / 1000.0) * agua_preco_m3
 
 # ============================================================================
 # 📡 FUNÇÕES DE DADOS
@@ -419,7 +405,7 @@ def analisar(df, potencia_w, custo_limpeza):
         12 h de sol constante). Isso torna a perda em R$ defensável na banca.
       - A DECISÃO é feita no nível do período: soma-se a perda em R$ de todas as
         amostras, calcula-se a PERDA MÉDIA POR DIA e compara-se diretamente com o
-        CUSTO DA LIMPEZA (água + detergente + mão de obra + depreciação):
+        CUSTO DA LIMPEZA (água utilizada):
 
               compensa_limpar  =  (perda_diaria  >=  custo_limpeza)
 
@@ -1200,7 +1186,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 2.1 — aba Comparação (limpa x suja)</div>',
+        'margin:6px 0">🟢 versão 2.2 — custo de limpeza só com água</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
@@ -1229,24 +1215,17 @@ def main():
         st.markdown("---")
 
         # ============================================================================
-        # 💧 CUSTO DE LIMPEZA — insumos editáveis (água, detergente, mão de obra...)
+        # 💧 CUSTO DE LIMPEZA — água utilizada (editável)
         # ============================================================================
         st.subheader("💧 Custo de Limpeza")
-        st.caption("O custo é a **soma dos insumos**. Ajuste conforme sua realidade.")
+        st.caption("Custo da **água** usada na limpeza. Ajuste conforme sua realidade.")
 
-        with st.expander("Ajustar insumos da limpeza", expanded=False):
+        with st.expander("Ajustar água da limpeza", expanded=False):
             agua_litros    = st.number_input("Água por limpeza (L)", min_value=0.0, value=AGUA_LITROS_PADRAO, step=0.5)
             agua_preco_m3  = st.number_input("Preço da água (R$/m³)", min_value=0.0, value=AGUA_PRECO_M3_PADRAO, step=0.5, format="%.2f")
-            det_ml         = st.number_input("Detergente por limpeza (ml)", min_value=0.0, value=DETERGENTE_ML_PADRAO, step=5.0)
-            det_preco_l    = st.number_input("Preço do detergente (R$/L)", min_value=0.0, value=DETERGENTE_PRECO_L_PADRAO, step=0.5, format="%.2f")
-            mo_min         = st.number_input("Tempo de mão de obra (min)", min_value=0.0, value=MAO_OBRA_MIN_PADRAO, step=1.0)
-            mo_hora        = st.number_input("Valor da mão de obra (R$/h)", min_value=0.0, value=MAO_OBRA_HORA_PADRAO, step=1.0, format="%.2f")
-            deprec         = st.number_input("Depreciação equip. (R$/limpeza)", min_value=0.0, value=DEPRECIACAO_PADRAO, step=0.05, format="%.2f")
 
         # Custo total desta limpeza (R$), usado em toda a análise e decisão
-        custo_limpeza_atual = custo_total_limpeza(
-            agua_litros, agua_preco_m3, det_ml, det_preco_l, mo_min, mo_hora, deprec
-        )
+        custo_limpeza_atual = custo_total_limpeza(agua_litros, agua_preco_m3)
         card("Custo total da limpeza", f"R$ {custo_limpeza_atual:.2f}", "por limpeza", "#a78bfa")
 
         st.markdown("---")
@@ -1299,7 +1278,7 @@ def main():
             st.warning("Nenhum dado para o período selecionado.")
             st.stop()
 
-        # Análise (usa o custo de limpeza calculado a partir dos insumos)
+        # Análise (usa o custo de limpeza calculado a partir da água)
         an = analisar(df, potencia_cliente, custo_limpeza_atual)
         ultima = df.iloc[-1]
         ult_an = an.iloc[-1]
@@ -1353,7 +1332,7 @@ def main():
         with c8:
             card("Perda Diária", f"R$ {ult_an['perda_diaria_est']:.2f}", "média/dia", "#fb923c")
         with c9:
-            card("Custo Limpeza", f"R$ {custo_limpeza_atual:.2f}", "insumos", "#a78bfa")
+            card("Custo Limpeza", f"R$ {custo_limpeza_atual:.2f}", "água", "#a78bfa")
         with c10:
             payback = ult_an["dias_payback"]
             payback_txt = f"{payback:.1f}" if payback is not None else "—"
