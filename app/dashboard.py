@@ -1077,7 +1077,33 @@ def _cards_perda_placa(pv, cor, rotulo_periodo):
     with l3:
         card("Perda em R$", f"R$ {pv['perda_rs']:.4f}", rotulo_periodo, cor)
 
-def _coluna_placa(df, ultima, placa, faixas, sufixo, pmax):
+def _diagnostico_placa(df, pv, custo_limpeza):
+    """
+    Mesmo critério do "Diagnóstico Atual" da aba Dashboard, aplicado a UMA placa:
+      - indicativo de sujeira: perda no período > LIMIAR_SUJEIRA (% do esperado)
+      - perda diária: perda em R$ no período ÷ nº de dias do período
+      - compensa limpar: indicativo de sujeira E perda diária ≥ custo da limpeza
+    Retorna (classe_css, mensagem).
+    """
+    if pv is None:
+        return "warn", "⚠️ Sem leituras suficientes no período para diagnosticar."
+    d = pv["df"]
+    dias = max(1, (d["timestamp"].max() - d["timestamp"].min()).days + 1)
+    perda_diaria = pv["perda_rs"] / dias
+    indicativo = pv["perda_pct"] > LIMIAR_SUJEIRA
+    compensa = indicativo and perda_diaria >= custo_limpeza
+
+    if not indicativo:
+        return "ok", f"✅ Placa OK ({pv['perda_pct']:.1f}% de perda). Limpeza não necessária."
+    if compensa:
+        return "alert", (f"🚨 Sujeira detectada. Perda ~R${perda_diaria:.2f}/dia ≥ "
+                         f"custo de limpeza R${custo_limpeza:.2f}. COMPENSA LIMPAR.")
+    dias_payback = custo_limpeza / perda_diaria if perda_diaria > 0 else None
+    payback_txt = f"{dias_payback:.1f} dias" if dias_payback else "—"
+    return "warn", (f"⚠️ Sujeira leve. Perda ~R${perda_diaria:.2f}/dia < custo R${custo_limpeza:.2f}. "
+                    f"Aguardar (a sujeira paga a limpeza em ~{payback_txt}).")
+
+def _coluna_placa(df, ultima, placa, faixas, sufixo, pmax, custo_limpeza):
     """Desenha uma coluna completa (cards + gráficos) para UMA placa."""
     cor = placa["cor"]
 
@@ -1088,6 +1114,11 @@ def _coluna_placa(df, ultima, placa, faixas, sufixo, pmax):
         f'{placa["emoji"]} {placa["nome"]}</div></div>',
         unsafe_allow_html=True,
     )
+
+    # 🚦 Diagnóstico desta placa (mesmo formato da aba Dashboard)
+    pv = perda_vs_esperado(df, placa["potencia"], pmax)
+    cls, msg = _diagnostico_placa(df, pv, custo_limpeza)
+    st.markdown(f'<div class="decision-box {cls}">{msg}</div>', unsafe_allow_html=True)
 
     grandezas = [
         ("potencia", "Potência", "W"),
@@ -1115,7 +1146,6 @@ def _coluna_placa(df, ultima, placa, faixas, sufixo, pmax):
         card("Energia gerada", f"{energia:.2f}", "Wh no período", cor)
 
     # 📉 Perda desta placa no período (vs esperado: Pmax × G/1000)
-    pv = perda_vs_esperado(df, placa["potencia"], pmax)
     _cards_perda_placa(pv, cor, "no período")
 
     # Gráficos (mesma escala Y que a outra coluna)
@@ -1328,9 +1358,9 @@ def render_comparacao(custo_limpeza, pmax):
     # ⬅️ LIMPA | SUJA ➡️
     col_esq, col_dir = st.columns(2, gap="large")
     with col_esq:
-        _coluna_placa(df_ts, ultima, PLACA_LIMPA, faixas, "limpa", pmax)
+        _coluna_placa(df_ts, ultima, PLACA_LIMPA, faixas, "limpa", pmax, custo_limpeza)
     with col_dir:
-        _coluna_placa(df_ts, ultima, PLACA_SUJA, faixas, "suja", pmax)
+        _coluna_placa(df_ts, ultima, PLACA_SUJA, faixas, "suja", pmax, custo_limpeza)
 
     st.markdown("---")
 
@@ -1398,7 +1428,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 2.4 — perda de cada placa</div>',
+        'margin:6px 0">🟢 versão 2.5 — diagnóstico por placa</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
