@@ -83,11 +83,11 @@ st.markdown("""<style>
 
 html, body, [class*="css"], .stMarkdown, p, span, label { font-family:'Inter',sans-serif; }
 
-/* 🌌 Fundo: azul-marinho com um brilho de sol no canto — o painel "olha" pro céu */
+/* 🌲 Fundo: verde escuro com um brilho de sol no canto — o painel "olha" pro céu */
 .stApp{
     background:
         radial-gradient(ellipse 900px 520px at 88% -6%, rgba(250,204,21,0.16), transparent 60%),
-        linear-gradient(180deg,#050F1C 0%,#0B2239 32%,#0F2D4D 58%,#050F1C 100%);
+        linear-gradient(180deg,#04140E 0%,#0B3D2A 32%,#0E4C36 58%,#04140E 100%);
 }
 
 h1,h2,h3{ font-family:'Space Grotesk',sans-serif; letter-spacing:.2px; }
