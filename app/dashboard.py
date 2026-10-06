@@ -1032,7 +1032,52 @@ def _faixa_comum(df, campos, comecar_no_zero=False):
     inferior = 0 if (comecar_no_zero and lo >= 0) else lo - margem
     return [inferior, hi + margem]
 
-def _coluna_placa(df, ultima, placa, faixas, sufixo):
+def perda_vs_esperado(df, campo_pot, pmax):
+    """
+    Perda de UMA placa em relação ao que ela deveria gerar pela regra física do TCC:
+        P_esperada = Pmax × G / 1000      (G = irradiação, field7)
+    A cada leitura: perda = max(0, P_esperada − P_real), multiplicada pelo
+    intervalo real até a leitura anterior (limitado a 30 min) → Wh.
+    Retorna None se não houver leituras suficientes.
+    """
+    d = df[["timestamp", campo_pot, "field7"]].dropna().sort_values("timestamp").copy()
+    if len(d) < 2:
+        return None
+    dt_h = d["timestamp"].diff().dt.total_seconds().div(3600).fillna(0).clip(upper=0.5)
+    d["esperada"] = pmax * d["field7"].clip(lower=0) / IRRADIANCIA_STC
+    d["real"] = d[campo_pot].clip(lower=0)
+    d["perda_w"] = (d["esperada"] - d["real"]).clip(lower=0)
+    d["perda_wh_acum"] = (d["perda_w"] * dt_h).cumsum()
+
+    e_esperada = float((d["esperada"] * dt_h).sum())
+    perda_wh = float(d["perda_wh_acum"].iloc[-1])
+    ult = d.iloc[-1]
+    return {
+        "df": d,
+        "perda_wh": perda_wh,
+        "perda_pct": perda_wh / e_esperada * 100 if e_esperada > 0 else 0.0,
+        "perda_rs": perda_wh / 1000.0 * TARIFA_KWH,
+        "perda_atual_pct": (ult["perda_w"] / ult["esperada"] * 100) if ult["esperada"] > 0 else 0.0,
+    }
+
+def _cards_perda_placa(pv, cor, rotulo_periodo):
+    """3 cards com a perda de uma placa (vs esperado)."""
+    l1, l2, l3 = st.columns(3)
+    if pv is None:
+        for col in (l1, l2, l3):
+            with col:
+                card("Perda", "—", "sem leituras", cor)
+        return
+    cor_atual = "#ef4444" if pv["perda_atual_pct"] > LIMIAR_SUJEIRA else "#22c55e"
+    cor_per = "#ef4444" if pv["perda_pct"] > LIMIAR_SUJEIRA else "#22c55e"
+    with l1:
+        card("Perda atual", f"{pv['perda_atual_pct']:.1f}", "% vs esperado", cor_atual)
+    with l2:
+        card(f"Perda {rotulo_periodo}", f"{pv['perda_wh']:.2f}", f"Wh ({pv['perda_pct']:.1f}% do esperado)", cor_per)
+    with l3:
+        card("Perda em R$", f"R$ {pv['perda_rs']:.4f}", rotulo_periodo, cor)
+
+def _coluna_placa(df, ultima, placa, faixas, sufixo, pmax):
     """Desenha uma coluna completa (cards + gráficos) para UMA placa."""
     cor = placa["cor"]
 
@@ -1069,6 +1114,10 @@ def _coluna_placa(df, ultima, placa, faixas, sufixo):
     with s3:
         card("Energia gerada", f"{energia:.2f}", "Wh no período", cor)
 
+    # 📉 Perda desta placa no período (vs esperado: Pmax × G/1000)
+    pv = perda_vs_esperado(df, placa["potencia"], pmax)
+    _cards_perda_placa(pv, cor, "no período")
+
     # Gráficos (mesma escala Y que a outra coluna)
     for chave, rotulo, unid in grandezas:
         fig = go.Figure(go.Scatter(
@@ -1076,12 +1125,18 @@ def _coluna_placa(df, ultima, placa, faixas, sufixo):
             fill="tozeroy", fillcolor=hex_para_rgba(cor, 0.15),
             line=dict(color=cor, width=2), name=rotulo,
         ))
+        if chave == "potencia" and pv is not None:
+            fig.add_trace(go.Scatter(
+                x=pv["df"]["timestamp"], y=pv["df"]["esperada"],
+                mode="lines", line=dict(color="#facc15", width=2, dash="dash"),
+                name="Esperada (Pmax × G/1000)",
+            ))
         fig.update_layout(**LAY, title=f"{rotulo} ({unid})", yaxis_title=unid, height=280)
         if faixas.get(chave):
             fig.update_yaxes(range=faixas[chave])
         st.plotly_chart(fig, use_container_width=True, key=f"cmp_{chave}_{sufixo}")
 
-def _secao_perda_acumulada(custo_limpeza):
+def _secao_perda_acumulada(custo_limpeza, pmax):
     """
     Contador de perda causada pela sujeira, acumulado desde a ÚLTIMA LIMPEZA.
 
@@ -1123,8 +1178,9 @@ def _secao_perda_acumulada(custo_limpeza):
         df = buscar_historico_thingspeak(ultima_limpeza.date(), agora.date())
 
     f_l, f_s = PLACA_LIMPA["potencia"], PLACA_SUJA["potencia"]
+    df_desde = df[df["timestamp"] >= ultima_limpeza] if not df.empty else df
     if not df.empty:
-        df = df[df["timestamp"] >= ultima_limpeza][["timestamp", f_l, f_s]].dropna().sort_values("timestamp")
+        df = df_desde[["timestamp", f_l, f_s]].dropna().sort_values("timestamp").copy()
 
     if df.empty or len(df) < 2:
         st.info("Ainda não há leituras suficientes desde a última limpeza. O contador começa a subir com as próximas leituras.")
@@ -1170,14 +1226,38 @@ def _secao_perda_acumulada(custo_limpeza):
         line=dict(color="#f87171", width=2), name="Perda acumulada",
     ))
     fig_acum.update_layout(**LAY, title="Energia perdida acumulada desde a última limpeza (Wh)", yaxis_title="Wh", height=300)
+    fig_acum.update_layout(title="Perda da placa suja em relação à limpa — acumulada desde a limpeza (Wh)")
     st.plotly_chart(fig_acum, use_container_width=True, key="cmp_perda_acum")
 
-def render_comparacao(custo_limpeza):
+    # 🔀 Perda de CADA placa desde a limpeza (vs esperado: Pmax × G/1000)
+    st.markdown("#### Perda de cada placa desde a limpeza")
+    st.caption(f"Referência de cada placa: P_esperada = Pmax × G/1000, com Pmax = {pmax:.0f} W (barra lateral).")
+    resultados = {}
+    col_a, col_b = st.columns(2, gap="large")
+    for col, placa in ((col_a, PLACA_LIMPA), (col_b, PLACA_SUJA)):
+        with col:
+            st.markdown(f'<h4 style="color:{placa["cor"]}!important;margin:0 0 6px 0">'
+                        f'{placa["emoji"]} {placa["nome"]}</h4>', unsafe_allow_html=True)
+            pv = perda_vs_esperado(df_desde, placa["potencia"], pmax)
+            resultados[placa["nome"]] = (pv, placa["cor"])
+            _cards_perda_placa(pv, placa["cor"], "desde a limpeza")
+
+    fig_cada = go.Figure()
+    for nome, (pv, cor) in resultados.items():
+        if pv is not None:
+            fig_cada.add_trace(go.Scatter(
+                x=pv["df"]["timestamp"], y=pv["df"]["perda_wh_acum"],
+                mode="lines", line=dict(color=cor, width=2), name=nome,
+            ))
+    fig_cada.update_layout(**LAY, title="Perda acumulada de cada placa vs esperado (Wh)", yaxis_title="Wh", height=300)
+    st.plotly_chart(fig_cada, use_container_width=True, key="cmp_perda_cada")
+
+def render_comparacao(custo_limpeza, pmax):
     """Aba que separa as duas placas: placa LIMPA à esquerda e placa SUJA à direita."""
     st.subheader("⚖️ Comparação — Placa Limpa x Placa Suja")
 
     # 🧽 Contador de perda desde a última limpeza (independe do período abaixo)
-    _secao_perda_acumulada(custo_limpeza)
+    _secao_perda_acumulada(custo_limpeza, pmax)
     st.markdown("---")
 
     # 📅 Período (independente da aba "Minha Placa ao Vivo")
@@ -1240,13 +1320,17 @@ def render_comparacao(custo_limpeza):
         "tensao":      _faixa_comum(df_ts, [PLACA_LIMPA["tensao"], PLACA_SUJA["tensao"]], comecar_no_zero=True),
         "temperatura": _faixa_comum(df_ts, [PLACA_LIMPA["temperatura"], PLACA_SUJA["temperatura"]]),
     }
+    # Garante que a curva de potência ESPERADA também caiba no gráfico
+    esperada_max = (pmax * df_ts["field7"].clip(lower=0) / IRRADIANCIA_STC).max()
+    if faixas["potencia"] and pd.notna(esperada_max):
+        faixas["potencia"][1] = max(faixas["potencia"][1], float(esperada_max) * 1.08)
 
     # ⬅️ LIMPA | SUJA ➡️
     col_esq, col_dir = st.columns(2, gap="large")
     with col_esq:
-        _coluna_placa(df_ts, ultima, PLACA_LIMPA, faixas, "limpa")
+        _coluna_placa(df_ts, ultima, PLACA_LIMPA, faixas, "limpa", pmax)
     with col_dir:
-        _coluna_placa(df_ts, ultima, PLACA_SUJA, faixas, "suja")
+        _coluna_placa(df_ts, ultima, PLACA_SUJA, faixas, "suja", pmax)
 
     st.markdown("---")
 
@@ -1314,7 +1398,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 2.3 — perda acumulada desde a limpeza</div>',
+        'margin:6px 0">🟢 versão 2.4 — perda de cada placa</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
@@ -1387,7 +1471,7 @@ def main():
         render_placa_ao_vivo()
 
     with tab_cmp:
-        render_comparacao(custo_limpeza_atual)
+        render_comparacao(custo_limpeza_atual, potencia_cliente)
 
     with tab3:
         render_aba_email()
