@@ -1019,11 +1019,11 @@ def render_placa_ao_vivo():
 #   • requisitos de limpeza (limiar de sujeira e perda R$/dia x custo da água)
 # A irradiação é comum às duas placas e aparece uma vez só, no topo.
 
-# Fields de cada placa no canal ThingSpeak + o rótulo esperado no teste
+# Fields de cada placa no canal ThingSpeak (os nomes são só rótulos das bancadas)
 PLACA_LIMPA = {"nome": "Placa Limpa", "emoji": "🟢", "cor": "#22c55e",
-               "potencia": "field4", "esperado": "LIMPA"}
+               "potencia": "field4"}
 PLACA_SUJA  = {"nome": "Placa Suja",  "emoji": "🟠", "cor": "#f59e0b",
-               "potencia": "field1", "esperado": "SUJA"}
+               "potencia": "field1"}
 
 # Abaixo dessa irradiação (noite/amanhecer/entardecer) a comparação vira ruído,
 # então essas leituras não entram no julgamento.
@@ -1168,7 +1168,7 @@ def _coluna_julgamento(df, placa, a, pmax, custo_limpeza, faixa_pot):
     with c1:
         card("Potência medida", _fmt(a["pot_atual"]), "W (agora)", cor)
     with c2:
-        card("Potência esperada", _fmt(a["pot_esperada"]), "W (Pmax × G/1000)", "#facc15")
+        card("Potência esperada", _fmt(a["pot_esperada"]), "W (Pmax × fator × G/1000)", "#facc15")
     c3, c4 = st.columns(2)
     with c3:
         card("Energia gerada", _fmt(a["e_real"], 2), "Wh no período", cor)
@@ -1191,7 +1191,7 @@ def _coluna_julgamento(df, placa, a, pmax, custo_limpeza, faixa_pot):
     fig.update_layout(**LAY, title="Potência medida x esperada (W)", yaxis_title="W", height=300)
     if faixa_pot:
         fig.update_yaxes(range=faixa_pot)
-    st.plotly_chart(fig, use_container_width=True, key=f"cmp_pot_{placa['esperado']}")
+    st.plotly_chart(fig, use_container_width=True, key=f"cmp_pot_{placa['potencia']}")
 
 def _secao_registro_limpeza(custo_limpeza):
     """
@@ -1257,12 +1257,15 @@ def _secao_registro_limpeza(custo_limpeza):
     with k3:
         card("Perda acumulada", _fmt_rs(perda_rs), f"custo da limpeza {_fmt_rs(custo_limpeza)}", "#fb923c")
 
-def render_comparacao(custo_limpeza, pmax):
+def render_comparacao(custo_limpeza, pmax_nominal, fator):
+    # Potência de referência da placa = nominal × fator de desempenho (barra lateral).
+    # A irradiação usada é SEMPRE a do sensor (field7) — nenhuma placa serve de referência.
+    pmax = pmax_nominal * fator
     """Aba de julgamento: cada placa recebe o veredito LIMPA/SUJA e a decisão de limpeza."""
     st.subheader("⚖️ Comparação — Placa Limpa x Placa Suja")
     st.caption(
         "O sistema compara a potência **medida** de cada placa com a potência **esperada** "
-        "(Pmax × G/1000) e decide se ela está **LIMPA** ou **SUJA** e se a limpeza compensa. "
+        "(Pmax × fator × G_sensor/1000) e decide se ela está **LIMPA** ou **SUJA** e se a limpeza compensa. "
         f"Só entram no julgamento leituras com irradiação ≥ {IRRAD_MIN_JULGAMENTO:.0f} W/m²."
     )
 
@@ -1316,7 +1319,8 @@ def render_comparacao(custo_limpeza, pmax):
     with t1:
         card("Irradiação (comum às duas)", _fmt(ultima.get("field7"), 0), "W/m² agora", "#facc15")
     with t2:
-        card("Potência nominal (Pmax)", f"{pmax:.0f}", "W — barra lateral", "#67e8f9")
+        card("Potência de referência", f"{pmax:.1f}",
+             f"W = {pmax_nominal:.0f} W × fator {fator:.2f}", "#67e8f9")
     with t3:
         card("Custo da limpeza", _fmt_rs(custo_limpeza), "água por limpeza", "#a78bfa")
 
@@ -1324,18 +1328,29 @@ def render_comparacao(custo_limpeza, pmax):
     a_limpa = _avaliar_placa(df_ts, PLACA_LIMPA, pmax, custo_limpeza)
     a_suja = _avaliar_placa(df_ts, PLACA_SUJA, pmax, custo_limpeza)
 
-    # 🎯 Resultado do teste: o sistema acertou o estado real de cada placa?
-    julgadas = [(p, a) for p, a in ((PLACA_LIMPA, a_limpa), (PLACA_SUJA, a_suja)) if a["veredito"] != "SEM SOL"]
-    if not julgadas:
+    # 🕒 Qual trecho do período foi julgado (só leituras com sol)
+    sol = df_ts[df_ts["field7"] >= IRRAD_MIN_JULGAMENTO]
+    if sol.empty:
         st.markdown(
             '<div class="decision-box warn">🌙 Sem sol suficiente no período para julgar as placas. '
             'Escolha um período com leituras durante o dia.</div>', unsafe_allow_html=True)
     else:
-        acertos = sum(a["veredito"] == p["esperado"] for p, a in julgadas)
-        cls = "ok" if acertos == len(julgadas) else "alert"
-        st.markdown(
-            f'<div class="decision-box {cls}">🎯 Resultado do teste: o sistema classificou corretamente '
-            f'{acertos} de {len(julgadas)} placa(s).</div>', unsafe_allow_html=True)
+        ini, fim = sol["timestamp"].min(), sol["timestamp"].max()
+        st.info(
+            f"🕒 Julgamento feito com as **{len(sol)} leituras com sol** do período "
+            f"({ini.strftime('%d/%m %H:%M')} → {fim.strftime('%d/%m %H:%M')}). "
+            "À noite o veredito continua valendo para esse trecho; só os cards \"agora\" zeram."
+        )
+        # Ajuda a escolher o fator: quanto cada placa gerou em relação ao nominal × sensor
+        e_nom = float((pmax_nominal * sol["field7"] / IRRADIANCIA_STC).sum())
+        if e_nom > 0:
+            d_l = sol[PLACA_LIMPA["potencia"]].clip(lower=0).sum() / e_nom
+            d_s = sol[PLACA_SUJA["potencia"]].clip(lower=0).sum() / e_nom
+            st.caption(
+                f"Desempenho observado em relação ao nominal ({pmax_nominal:.0f} W × G_sensor/1000): "
+                f"{PLACA_LIMPA['nome']} {d_l:.0%} · {PLACA_SUJA['nome']} {d_s:.0%}. "
+                f"Fator configurado: {fator:.0%}."
+            )
 
     # Mesma escala Y nos dois gráficos (inclui a curva esperada)
     esperada = pmax * df_ts["field7"].clip(lower=0) / IRRADIANCIA_STC
@@ -1365,7 +1380,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 2.6 — julgamento limpa/suja por placa</div>',
+        'margin:6px 0">🟢 versão 2.7 — julgamento por sensor + fator de desempenho</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
@@ -1390,6 +1405,15 @@ def main():
                 st.success(f"✅ Potência {potencia_cliente:.0f}W salva na planilha!")
                 st.cache_data.clear()
                 st.rerun()
+
+        fator_desempenho = st.slider(
+            "Fator de desempenho da placa:",
+            min_value=0.30, max_value=1.00, value=EFICIENCIA, step=0.01,
+            help="Fração da potência nominal que a placa entrega na prática (temperatura, "
+                 "carga sem MPPT, perdas). A potência esperada na aba Comparação é "
+                 "Pmax × fator × G_sensor/1000.",
+        )
+        st.caption(f"Referência: {potencia_cliente * fator_desempenho:.1f} W a 1000 W/m²")
 
         st.markdown("---")
 
@@ -1438,7 +1462,7 @@ def main():
         render_placa_ao_vivo()
 
     with tab_cmp:
-        render_comparacao(custo_limpeza_atual, potencia_cliente)
+        render_comparacao(custo_limpeza_atual, potencia_cliente, fator_desempenho)
 
     with tab3:
         render_aba_email()
