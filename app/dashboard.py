@@ -124,6 +124,19 @@ h2,h3{color:#bae6fd!important}
 .alert{background:#4a1416;border-color:#ef4444;color:#fecaca}
 .warn{background:#4a320b;border-color:#f59e0b;color:#fef3c7}
 
+/* ⚖️ Veredito por placa (aba Comparação) */
+.veredito{border:2px solid;border-radius:12px;padding:16px 14px;text-align:center;margin-bottom:12px}
+.veredito-placa{font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700}
+.veredito-label{font-family:'Space Grotesk',sans-serif;font-size:36px;font-weight:700;letter-spacing:.05em;margin:2px 0}
+.veredito-sub{font-size:13px;color:#cbd5e1}
+
+/* 🧽 Requisitos de limpeza (aba Comparação) */
+.req{background:#0b2239;border:1px solid #1e6091;border-radius:10px;padding:12px 16px;margin:4px 0 12px 0}
+.req-titulo{font-size:11px;color:#7da9c7;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
+.req-linha{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid rgba(30,96,145,.4);font-size:14px;color:#e2e8f0}
+.req-valor{font-weight:600;white-space:nowrap}
+.req-decisao{margin-top:10px;padding:10px;border-radius:8px;text-align:center;font-weight:700;font-size:15px;border:1px solid}
+
 /* 📱 Sidebar com o mesmo tom de céu/painel + filete dourado */
 section[data-testid="stSidebar"]{
     background:linear-gradient(180deg,#071b2e 0%,#0b2239 100%);
@@ -997,298 +1010,261 @@ def render_placa_ao_vivo():
             )
 
 # ============================================================================
-# ⚖️ ABA: COMPARAÇÃO — PLACA LIMPA (esquerda) x PLACA SUJA (direita)
+# ⚖️ ABA: COMPARAÇÃO — JULGAMENTO LIMPA x SUJA DE CADA PLACA
 # ============================================================================
+# Objetivo: tela enxuta para a banca e para os testes. Para cada placa mostra só:
+#   • veredito do sistema (LIMPA / SUJA)
+#   • potência medida x potência esperada (Pmax × G/1000)
+#   • energia gerada x energia esperada
+#   • requisitos de limpeza (limiar de sujeira e perda R$/dia x custo da água)
+# A irradiação é comum às duas placas e aparece uma vez só, no topo.
 
-# Fields de cada placa no canal ThingSpeak (conforme THINGSPEAK_CAMPOS)
+# Fields de cada placa no canal ThingSpeak + o rótulo esperado no teste
 PLACA_LIMPA = {"nome": "Placa Limpa", "emoji": "🟢", "cor": "#22c55e",
-               "potencia": "field4", "tensao": "field5", "temperatura": "field6"}
+               "potencia": "field4", "esperado": "LIMPA"}
 PLACA_SUJA  = {"nome": "Placa Suja",  "emoji": "🟠", "cor": "#f59e0b",
-               "potencia": "field1", "tensao": "field2", "temperatura": "field3"}
+               "potencia": "field1", "esperado": "SUJA"}
 
-# Abaixo dessa potência na placa limpa (noite/amanhecer) a razão Suja/Limpa vira ruído
-POT_MIN_RAZAO = 0.5  # W
+# Abaixo dessa irradiação (noite/amanhecer/entardecer) a comparação vira ruído,
+# então essas leituras não entram no julgamento.
+IRRAD_MIN_JULGAMENTO = 50.0    # W/m²
+# Energia esperada mínima no período para o julgamento ser confiável
+ENERGIA_MIN_JULGAMENTO = 1.0   # Wh
 
-def energia_periodo_wh(df, campo_pot):
-    """
-    Integra a potência no tempo (W × h = Wh) usando o intervalo REAL entre leituras.
-    Intervalos maiores que 30 min (falha de envio / ESP32 desligado) são limitados
-    a 30 min para não inflar a energia calculada.
-    """
-    d = df[["timestamp", campo_pot]].dropna().sort_values("timestamp")
-    if len(d) < 2:
-        return 0.0
-    dt_h = d["timestamp"].diff().dt.total_seconds().div(3600).fillna(0).clip(upper=0.5)
-    return float((d[campo_pot].clip(lower=0) * dt_h).sum())
+def _fmt(v, casas=1):
+    """Formata número; devolve '—' se vazio/NaN."""
+    return f"{v:.{casas}f}" if v is not None and pd.notna(v) else "—"
 
-def _faixa_comum(df, campos, comecar_no_zero=False):
-    """Calcula a mesma faixa do eixo Y para as duas placas, para a comparação
-    visual lado a lado ser justa (mesma escala nos dois gráficos)."""
-    valores = pd.concat([df[c] for c in campos]).dropna()
-    if valores.empty:
-        return None
-    lo, hi = float(valores.min()), float(valores.max())
-    margem = (hi - lo) * 0.08 or 1.0
-    inferior = 0 if (comecar_no_zero and lo >= 0) else lo - margem
-    return [inferior, hi + margem]
+def _fmt_rs(v):
+    """R$ com 2 casas para valores ≥ R$1 e 3 casas para centavos (a perda é pequena)."""
+    if v is None or pd.isna(v):
+        return "—"
+    return f"R$ {v:.2f}" if abs(v) >= 1 else f"R$ {v:.3f}"
 
-def perda_vs_esperado(df, campo_pot, pmax):
+def perda_vs_esperado(df, campo_pot, pmax, g_min=0.0):
     """
     Perda de UMA placa em relação ao que ela deveria gerar pela regra física do TCC:
         P_esperada = Pmax × G / 1000      (G = irradiação, field7)
-    A cada leitura: perda = max(0, P_esperada − P_real), multiplicada pelo
-    intervalo real até a leitura anterior (limitado a 30 min) → Wh.
+    Cada leitura é multiplicada pelo intervalo real até a anterior (limitado a
+    30 min) → Wh. Leituras com G < g_min são descartadas (sem sol = ruído).
     Retorna None se não houver leituras suficientes.
     """
     d = df[["timestamp", campo_pot, "field7"]].dropna().sort_values("timestamp").copy()
     if len(d) < 2:
         return None
-    dt_h = d["timestamp"].diff().dt.total_seconds().div(3600).fillna(0).clip(upper=0.5)
+    d["dt_h"] = d["timestamp"].diff().dt.total_seconds().div(3600).fillna(0).clip(upper=0.5)
+    d = d[d["field7"] >= g_min]
+    if d.empty:
+        return None
     d["esperada"] = pmax * d["field7"].clip(lower=0) / IRRADIANCIA_STC
     d["real"] = d[campo_pot].clip(lower=0)
     d["perda_w"] = (d["esperada"] - d["real"]).clip(lower=0)
-    d["perda_wh_acum"] = (d["perda_w"] * dt_h).cumsum()
 
-    e_esperada = float((d["esperada"] * dt_h).sum())
-    perda_wh = float(d["perda_wh_acum"].iloc[-1])
-    ult = d.iloc[-1]
+    e_esperada = float((d["esperada"] * d["dt_h"]).sum())
+    e_real = float((d["real"] * d["dt_h"]).sum())
+    perda_wh = float((d["perda_w"] * d["dt_h"]).sum())
     return {
         "df": d,
+        "e_esperada": e_esperada,
+        "e_real": e_real,
         "perda_wh": perda_wh,
         "perda_pct": perda_wh / e_esperada * 100 if e_esperada > 0 else 0.0,
         "perda_rs": perda_wh / 1000.0 * TARIFA_KWH,
-        "perda_atual_pct": (ult["perda_w"] / ult["esperada"] * 100) if ult["esperada"] > 0 else 0.0,
     }
 
-def _cards_perda_placa(pv, cor, rotulo_periodo):
-    """3 cards com a perda de uma placa (vs esperado)."""
-    l1, l2, l3 = st.columns(3)
-    if pv is None:
-        for col in (l1, l2, l3):
-            with col:
-                card("Perda", "—", "sem leituras", cor)
-        return
-    cor_atual = "#ef4444" if pv["perda_atual_pct"] > LIMIAR_SUJEIRA else "#22c55e"
-    cor_per = "#ef4444" if pv["perda_pct"] > LIMIAR_SUJEIRA else "#22c55e"
-    with l1:
-        card("Perda atual", f"{pv['perda_atual_pct']:.1f}", "% vs esperado", cor_atual)
-    with l2:
-        card(f"Perda {rotulo_periodo}", f"{pv['perda_wh']:.2f}", f"Wh ({pv['perda_pct']:.1f}% do esperado)", cor_per)
-    with l3:
-        card("Perda em R$", f"R$ {pv['perda_rs']:.4f}", rotulo_periodo, cor)
-
-def _diagnostico_placa(df, pv, custo_limpeza):
+def _avaliar_placa(df, placa, pmax, custo_limpeza):
     """
-    Mesmo critério do "Diagnóstico Atual" da aba Dashboard, aplicado a UMA placa:
-      - indicativo de sujeira: perda no período > LIMIAR_SUJEIRA (% do esperado)
-      - perda diária: perda em R$ no período ÷ nº de dias do período
-      - compensa limpar: indicativo de sujeira E perda diária ≥ custo da limpeza
-    Retorna (classe_css, mensagem).
+    Julga UMA placa no período e devolve tudo que a tela precisa:
+      veredito  : 'LIMPA' | 'SUJA' | 'SEM SOL'
+      req_sujeira : perda (% do esperado) > LIMIAR_SUJEIRA
+      req_custo   : perda (R$/dia) ≥ custo da limpeza
+      compensa    : SUJA  e  req_custo
     """
-    if pv is None:
-        return "warn", "⚠️ Sem leituras suficientes no período para diagnosticar."
-    d = pv["df"]
-    dias = max(1, (d["timestamp"].max() - d["timestamp"].min()).days + 1)
-    perda_diaria = pv["perda_rs"] / dias
-    indicativo = pv["perda_pct"] > LIMIAR_SUJEIRA
-    compensa = indicativo and perda_diaria >= custo_limpeza
+    ultima = df.iloc[-1]
+    g = ultima.get("field7")
+    pv = perda_vs_esperado(df, placa["potencia"], pmax, g_min=IRRAD_MIN_JULGAMENTO)
 
-    if not indicativo:
-        return "ok", f"✅ Placa OK ({pv['perda_pct']:.1f}% de perda). Limpeza não necessária."
-    if compensa:
-        return "alert", (f"🚨 Sujeira detectada. Perda ~R${perda_diaria:.2f}/dia ≥ "
-                         f"custo de limpeza R${custo_limpeza:.2f}. COMPENSA LIMPAR.")
-    dias_payback = custo_limpeza / perda_diaria if perda_diaria > 0 else None
-    payback_txt = f"{dias_payback:.1f} dias" if dias_payback else "—"
-    return "warn", (f"⚠️ Sujeira leve. Perda ~R${perda_diaria:.2f}/dia < custo R${custo_limpeza:.2f}. "
-                    f"Aguardar (a sujeira paga a limpeza em ~{payback_txt}).")
+    a = {
+        "pot_atual": ultima.get(placa["potencia"]),
+        "pot_esperada": pmax * max(0.0, g) / IRRADIANCIA_STC if pd.notna(g) else None,
+        "e_real": pv["e_real"] if pv else 0.0,
+        "e_esperada": pv["e_esperada"] if pv else 0.0,
+        "perda_pct": pv["perda_pct"] if pv else 0.0,
+        "perda_rs": pv["perda_rs"] if pv else 0.0,
+    }
 
-def _coluna_placa(df, ultima, placa, faixas, sufixo, pmax, custo_limpeza):
-    """Desenha uma coluna completa (cards + gráficos) para UMA placa."""
-    cor = placa["cor"]
+    dias = max(1, (df["timestamp"].max() - df["timestamp"].min()).days + 1)
+    a["perda_dia"] = a["perda_rs"] / dias
+    a["payback"] = custo_limpeza / a["perda_dia"] if a["perda_dia"] > 0 else None
 
-    # Cabeçalho da coluna
+    if pv is None or a["e_esperada"] < ENERGIA_MIN_JULGAMENTO:
+        a["veredito"] = "SEM SOL"
+    elif a["perda_pct"] > LIMIAR_SUJEIRA:
+        a["veredito"] = "SUJA"
+    else:
+        a["veredito"] = "LIMPA"
+
+    a["req_sujeira"] = a["perda_pct"] > LIMIAR_SUJEIRA
+    a["req_custo"] = a["perda_dia"] >= custo_limpeza
+    a["compensa"] = a["veredito"] == "SUJA" and a["req_custo"]
+    return a
+
+def _bloco_veredito(placa, a):
+    """Cartão grande com o resultado do julgamento."""
+    estilos = {
+        "LIMPA":   ("#0b3b24", "#22c55e", "#bbf7d0", "✅ LIMPA"),
+        "SUJA":    ("#4a1416", "#ef4444", "#fecaca", "🚨 SUJA"),
+        "SEM SOL": ("#1e293b", "#64748b", "#cbd5e1", "🌙 SEM SOL"),
+    }
+    bg, borda, texto, rotulo = estilos[a["veredito"]]
+    sub = ("irradiação baixa demais para julgar" if a["veredito"] == "SEM SOL"
+           else f"gerou {a['perda_pct']:.1f}% abaixo do esperado")
     st.markdown(
-        f'<div class="card" style="border:2px solid {cor};padding:12px 14px">'
-        f'<div class="card-value" style="color:{cor};font-size:22px">'
-        f'{placa["emoji"]} {placa["nome"]}</div></div>',
+        f'<div class="veredito" style="background:{bg};border-color:{borda}">'
+        f'<div class="veredito-placa" style="color:{placa["cor"]}">{placa["emoji"]} {placa["nome"]}</div>'
+        f'<div class="veredito-label" style="color:{texto}">{rotulo}</div>'
+        f'<div class="veredito-sub">{sub}</div></div>',
         unsafe_allow_html=True,
     )
 
-    # 🚦 Diagnóstico desta placa (mesmo formato da aba Dashboard)
-    pv = perda_vs_esperado(df, placa["potencia"], pmax)
-    cls, msg = _diagnostico_placa(df, pv, custo_limpeza)
-    st.markdown(f'<div class="decision-box {cls}">{msg}</div>', unsafe_allow_html=True)
+def _bloco_requisitos(a, custo_limpeza):
+    """Checklist dos requisitos de limpeza com os valores medidos e a decisão final."""
+    def linha(ok, texto, valor):
+        icone = "🔴" if ok else "🟢"
+        return (f'<div class="req-linha"><span>{icone} {texto}</span>'
+                f'<span class="req-valor">{valor}</span></div>')
 
-    grandezas = [
-        ("potencia", "Potência", "W"),
-        ("tensao", "Tensão", "V"),
-        ("temperatura", "Temperatura", "°C"),
-    ]
+    sinal_suj = "&gt;" if a["req_sujeira"] else "≤"
+    sinal_cus = "≥" if a["req_custo"] else "&lt;"
+    linhas = (
+        linha(a["req_sujeira"], "Perda acima do limiar de sujeira",
+              f'{a["perda_pct"]:.1f}% {sinal_suj} {LIMIAR_SUJEIRA:.0f}%')
+        + linha(a["req_custo"], "Perda por dia paga a limpeza",
+                f'{_fmt_rs(a["perda_dia"])}/dia {sinal_cus} {_fmt_rs(custo_limpeza)}')
+    )
 
-    # Valores atuais
-    cols = st.columns(3)
-    for col, (chave, rotulo, unid) in zip(cols, grandezas):
-        with col:
-            v = ultima.get(placa[chave])
-            card(f"{rotulo} atual", f"{v:.1f}" if pd.notna(v) else "—", unid, cor)
+    if a["veredito"] == "SEM SOL":
+        dec, bg, bd = "🌙 Aguardando sol para julgar", "#1e293b", "#64748b"
+    elif a["compensa"]:
+        dec, bg, bd = "🧽 LIMPAR AGORA — a perda já paga a água", "#4a1416", "#ef4444"
+    elif a["veredito"] == "SUJA":
+        pb = f"~{a['payback']:.1f} dias" if a["payback"] else "—"
+        dec, bg, bd = f"⏳ AGUARDAR — a limpeza se paga em {pb}", "#4a320b", "#f59e0b"
+    else:
+        dec, bg, bd = "✅ NÃO PRECISA LIMPAR", "#0b3b24", "#22c55e"
 
-    # Resumo do período
-    pot = df[placa["potencia"]]
-    tem_pot = pot.notna().any()
-    energia = energia_periodo_wh(df, placa["potencia"])
-    s1, s2, s3 = st.columns(3)
-    with s1:
-        card("Potência média", f"{pot.mean():.2f}" if tem_pot else "—", "W", cor)
-    with s2:
-        card("Pico de potência", f"{pot.max():.2f}" if tem_pot else "—", "W", cor)
-    with s3:
-        card("Energia gerada", f"{energia:.2f}", "Wh no período", cor)
+    st.markdown(
+        f'<div class="req"><div class="req-titulo">Requisitos de limpeza</div>{linhas}'
+        f'<div class="req-decisao" style="background:{bg};border-color:{bd};color:#f1f5f9">{dec}</div></div>',
+        unsafe_allow_html=True,
+    )
 
-    # 📉 Perda desta placa no período (vs esperado: Pmax × G/1000)
-    _cards_perda_placa(pv, cor, "no período")
+def _coluna_julgamento(df, placa, a, pmax, custo_limpeza, faixa_pot):
+    """Uma coluna completa (veredito + números + requisitos + 1 gráfico) para UMA placa."""
+    cor = placa["cor"]
+    _bloco_veredito(placa, a)
 
-    # Gráficos (mesma escala Y que a outra coluna)
-    for chave, rotulo, unid in grandezas:
-        fig = go.Figure(go.Scatter(
-            x=df["timestamp"], y=df[placa[chave]],
-            fill="tozeroy", fillcolor=hex_para_rgba(cor, 0.15),
-            line=dict(color=cor, width=2), name=rotulo,
-        ))
-        if chave == "potencia" and pv is not None:
-            fig.add_trace(go.Scatter(
-                x=pv["df"]["timestamp"], y=pv["df"]["esperada"],
-                mode="lines", line=dict(color="#facc15", width=2, dash="dash"),
-                name="Esperada (Pmax × G/1000)",
-            ))
-        fig.update_layout(**LAY, title=f"{rotulo} ({unid})", yaxis_title=unid, height=280)
-        if faixas.get(chave):
-            fig.update_yaxes(range=faixas[chave])
-        st.plotly_chart(fig, use_container_width=True, key=f"cmp_{chave}_{sufixo}")
+    c1, c2 = st.columns(2)
+    with c1:
+        card("Potência medida", _fmt(a["pot_atual"]), "W (agora)", cor)
+    with c2:
+        card("Potência esperada", _fmt(a["pot_esperada"]), "W (Pmax × G/1000)", "#facc15")
+    c3, c4 = st.columns(2)
+    with c3:
+        card("Energia gerada", _fmt(a["e_real"], 2), "Wh no período", cor)
+    with c4:
+        card("Energia esperada", _fmt(a["e_esperada"], 2), "Wh no período", "#facc15")
 
-def _secao_perda_acumulada(custo_limpeza, pmax):
+    _bloco_requisitos(a, custo_limpeza)
+
+    esperada = pmax * df["field7"].clip(lower=0) / IRRADIANCIA_STC
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["timestamp"], y=df[placa["potencia"]], name="Medida",
+        fill="tozeroy", fillcolor=hex_para_rgba(cor, 0.15),
+        line=dict(color=cor, width=2),
+    ))
+    fig.add_trace(go.Scatter(
+        x=df["timestamp"], y=esperada, name="Esperada",
+        line=dict(color="#facc15", width=2, dash="dash"),
+    ))
+    fig.update_layout(**LAY, title="Potência medida x esperada (W)", yaxis_title="W", height=300)
+    if faixa_pot:
+        fig.update_yaxes(range=faixa_pot)
+    st.plotly_chart(fig, use_container_width=True, key=f"cmp_pot_{placa['esperado']}")
+
+def _secao_registro_limpeza(custo_limpeza):
     """
-    Contador de perda causada pela sujeira, acumulado desde a ÚLTIMA LIMPEZA.
-
-    A placa limpa é a referência (mesmo sol, mesmo ambiente). A cada leitura,
-    a potência que a placa suja deixou de gerar é (P_limpa − P_suja), e ela é
-    multiplicada pelo intervalo real até a leitura anterior (Wh). Somando tudo
-    desde a limpeza, temos a energia perdida acumulada — que cresce conforme a
-    sujeira se acumula e ZERA quando uma nova limpeza é registrada.
+    Registro da última limpeza (zera o contador para um novo teste) e a perda da
+    placa suja em relação à limpa acumulada desde então.
+    A cada leitura: perda = max(0, P_limpa − P_suja) × intervalo real (≤ 30 min).
     """
-    st.subheader("🧽 Perda acumulada desde a última limpeza")
-
     agora = agora_brasil()
     ultima_limpeza = carregar_ultima_limpeza()
 
-    cb1, cb2 = st.columns([1, 2])
+    cb1, cb2 = st.columns(2)
     with cb1:
         if st.button("🧽 Registrar limpeza agora (zerar)", use_container_width=True, key="btn_limpeza_agora"):
             if gravar_ultima_limpeza(agora_brasil()):
                 st.cache_data.clear()
                 st.rerun()
     with cb2:
-        with st.expander("Limpei em outro horário — registrar data/hora manualmente"):
+        manual = st.checkbox("Limpei em outro horário (informar data/hora)", key="limpeza_manual_chk")
+
+    if manual:
+        m1, m2, m3 = st.columns([1, 1, 1])
+        with m1:
             data_l = st.date_input("Data da limpeza", value=agora.date(), max_value=agora.date(), key="limpeza_data")
+        with m2:
             hora_l = st.time_input("Hora da limpeza", value=agora.time().replace(second=0, microsecond=0), key="limpeza_hora")
-            if st.button("Salvar data da limpeza", key="btn_limpeza_manual"):
+        with m3:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            if st.button("Salvar data da limpeza", use_container_width=True, key="btn_limpeza_manual"):
                 if gravar_ultima_limpeza(datetime.combine(data_l, hora_l)):
                     st.cache_data.clear()
                     st.rerun()
 
     if ultima_limpeza is None:
-        st.info("Nenhuma limpeza registrada ainda. Clique em **Registrar limpeza agora** "
-                "logo depois de limpar a placa para começar a contagem.")
+        st.info("Nenhuma limpeza registrada ainda. Clique em **Registrar limpeza agora** logo depois de limpar a placa.")
         return
 
     dias = max(0.0, (agora - ultima_limpeza).total_seconds() / 86400)
     st.caption(f"Última limpeza: {ultima_limpeza.strftime('%d/%m/%Y %H:%M')} (horário de Brasília) — há {dias:.1f} dia(s)")
 
-    with st.spinner("Calculando perda desde a última limpeza..."):
-        df = buscar_historico_thingspeak(ultima_limpeza.date(), agora.date())
-
+    df = buscar_historico_thingspeak(ultima_limpeza.date(), agora.date())
     f_l, f_s = PLACA_LIMPA["potencia"], PLACA_SUJA["potencia"]
-    df_desde = df[df["timestamp"] >= ultima_limpeza] if not df.empty else df
     if not df.empty:
-        df = df_desde[["timestamp", f_l, f_s]].dropna().sort_values("timestamp").copy()
+        df = df[df["timestamp"] >= ultima_limpeza][["timestamp", f_l, f_s]].dropna().sort_values("timestamp")
 
     if df.empty or len(df) < 2:
-        st.info("Ainda não há leituras suficientes desde a última limpeza. O contador começa a subir com as próximas leituras.")
+        st.info("Ainda não há leituras suficientes desde a última limpeza.")
         return
 
-    # Mesmo critério de energia_periodo_wh: intervalo real, limitado a 30 min
     dt_h = df["timestamp"].diff().dt.total_seconds().div(3600).fillna(0).clip(upper=0.5)
     p_limpa = df[f_l].clip(lower=0)
     p_suja = df[f_s].clip(lower=0)
-    df["perda_wh_acum"] = ((p_limpa - p_suja).clip(lower=0) * dt_h).cumsum()
-
     e_limpa = float((p_limpa * dt_h).sum())
-    perda_wh = float(df["perda_wh_acum"].iloc[-1])
+    perda_wh = float(((p_limpa - p_suja).clip(lower=0) * dt_h).sum())
     perda_pct = perda_wh / e_limpa * 100 if e_limpa > 0 else 0.0
     perda_rs = perda_wh / 1000.0 * TARIFA_KWH
 
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3 = st.columns(3)
     with k1:
         card("Desde a limpeza", f"{dias:.1f}", "dias", "#67e8f9")
     with k2:
-        card("Energia perdida acumulada", f"{perda_wh:.2f}", "Wh", "#f87171")
-    with k3:
         cor_pct = "#ef4444" if perda_pct > LIMIAR_SUJEIRA else "#22c55e"
-        card("Perda acumulada", f"{perda_pct:.1f}", "% da energia da placa limpa", cor_pct)
-    with k4:
-        card("Perda em R$", f"R$ {perda_rs:.4f}", f"custo da limpeza R$ {custo_limpeza:.2f}", "#fb923c")
-
-    if custo_limpeza > 0:
-        if perda_rs >= custo_limpeza:
-            st.markdown(
-                f'<div class="decision-box alert">🚨 A perda acumulada (R$ {perda_rs:.4f}) já superou '
-                f'o custo da limpeza (R$ {custo_limpeza:.2f}). Compensa limpar.</div>',
-                unsafe_allow_html=True)
-        else:
-            st.markdown(
-                f'<div class="decision-box ok">✅ Perda acumulada R$ {perda_rs:.4f} — '
-                f'{perda_rs / custo_limpeza * 100:.1f}% do custo da limpeza (R$ {custo_limpeza:.2f}).</div>',
-                unsafe_allow_html=True)
-
-    fig_acum = go.Figure(go.Scatter(
-        x=df["timestamp"], y=df["perda_wh_acum"],
-        fill="tozeroy", fillcolor="rgba(248,113,113,0.15)",
-        line=dict(color="#f87171", width=2), name="Perda acumulada",
-    ))
-    fig_acum.update_layout(**LAY, title="Energia perdida acumulada desde a última limpeza (Wh)", yaxis_title="Wh", height=300)
-    fig_acum.update_layout(title="Perda da placa suja em relação à limpa — acumulada desde a limpeza (Wh)")
-    st.plotly_chart(fig_acum, use_container_width=True, key="cmp_perda_acum")
-
-    # 🔀 Perda de CADA placa desde a limpeza (vs esperado: Pmax × G/1000)
-    st.markdown("#### Perda de cada placa desde a limpeza")
-    st.caption(f"Referência de cada placa: P_esperada = Pmax × G/1000, com Pmax = {pmax:.0f} W (barra lateral).")
-    resultados = {}
-    col_a, col_b = st.columns(2, gap="large")
-    for col, placa in ((col_a, PLACA_LIMPA), (col_b, PLACA_SUJA)):
-        with col:
-            st.markdown(f'<h4 style="color:{placa["cor"]}!important;margin:0 0 6px 0">'
-                        f'{placa["emoji"]} {placa["nome"]}</h4>', unsafe_allow_html=True)
-            pv = perda_vs_esperado(df_desde, placa["potencia"], pmax)
-            resultados[placa["nome"]] = (pv, placa["cor"])
-            _cards_perda_placa(pv, placa["cor"], "desde a limpeza")
-
-    fig_cada = go.Figure()
-    for nome, (pv, cor) in resultados.items():
-        if pv is not None:
-            fig_cada.add_trace(go.Scatter(
-                x=pv["df"]["timestamp"], y=pv["df"]["perda_wh_acum"],
-                mode="lines", line=dict(color=cor, width=2), name=nome,
-            ))
-    fig_cada.update_layout(**LAY, title="Perda acumulada de cada placa vs esperado (Wh)", yaxis_title="Wh", height=300)
-    st.plotly_chart(fig_cada, use_container_width=True, key="cmp_perda_cada")
+        card("Energia perdida (suja x limpa)", f"{perda_wh:.2f}", f"Wh ({perda_pct:.1f}%)", cor_pct)
+    with k3:
+        card("Perda acumulada", _fmt_rs(perda_rs), f"custo da limpeza {_fmt_rs(custo_limpeza)}", "#fb923c")
 
 def render_comparacao(custo_limpeza, pmax):
-    """Aba que separa as duas placas: placa LIMPA à esquerda e placa SUJA à direita."""
+    """Aba de julgamento: cada placa recebe o veredito LIMPA/SUJA e a decisão de limpeza."""
     st.subheader("⚖️ Comparação — Placa Limpa x Placa Suja")
-
-    # 🧽 Contador de perda desde a última limpeza (independe do período abaixo)
-    _secao_perda_acumulada(custo_limpeza, pmax)
-    st.markdown("---")
+    st.caption(
+        "O sistema compara a potência **medida** de cada placa com a potência **esperada** "
+        "(Pmax × G/1000) e decide se ela está **LIMPA** ou **SUJA** e se a limpeza compensa. "
+        f"Só entram no julgamento leituras com irradiação ≥ {IRRAD_MIN_JULGAMENTO:.0f} W/m²."
+    )
 
     # 📅 Período (independente da aba "Minha Placa ao Vivo")
     hoje = agora_brasil().date()
@@ -1328,93 +1304,54 @@ def render_comparacao(custo_limpeza, pmax):
         return
 
     ultima = df_ts.iloc[-1]
+    n_sol = int((df_ts["field7"] >= IRRAD_MIN_JULGAMENTO).sum())
     st.caption(
         f"Período: {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')} "
-        f"— {len(df_ts)} leituras — última: {ultima['timestamp'].strftime('%d/%m/%Y %H:%M:%S')} (horário de Brasília)"
+        f"— {len(df_ts)} leituras ({n_sol} com sol) — última: "
+        f"{ultima['timestamp'].strftime('%d/%m/%Y %H:%M:%S')} (horário de Brasília)"
     )
 
-    # 🌤️ Condições comuns às duas placas (mesmo sol, mesmo ambiente)
-    a1, a2 = st.columns(2)
-    with a1:
-        v = ultima.get("field7")
-        card("Irradiação (comum às duas)", f"{v:.0f}" if pd.notna(v) else "—", "W/m²", "#facc15")
-    with a2:
-        v = ultima.get("field8")
-        card("Temperatura Externa", f"{v:.1f}" if pd.notna(v) else "—", "°C", "#a78bfa")
+    # 🌤️ Condições do teste (comuns às duas placas)
+    t1, t2, t3 = st.columns(3)
+    with t1:
+        card("Irradiação (comum às duas)", _fmt(ultima.get("field7"), 0), "W/m² agora", "#facc15")
+    with t2:
+        card("Potência nominal (Pmax)", f"{pmax:.0f}", "W — barra lateral", "#67e8f9")
+    with t3:
+        card("Custo da limpeza", _fmt_rs(custo_limpeza), "água por limpeza", "#a78bfa")
 
-    st.markdown("---")
+    # ⚖️ Julgamento de cada placa
+    a_limpa = _avaliar_placa(df_ts, PLACA_LIMPA, pmax, custo_limpeza)
+    a_suja = _avaliar_placa(df_ts, PLACA_SUJA, pmax, custo_limpeza)
 
-    # Mesma escala Y nos dois lados
-    faixas = {
-        "potencia":    _faixa_comum(df_ts, [PLACA_LIMPA["potencia"], PLACA_SUJA["potencia"]], comecar_no_zero=True),
-        "tensao":      _faixa_comum(df_ts, [PLACA_LIMPA["tensao"], PLACA_SUJA["tensao"]], comecar_no_zero=True),
-        "temperatura": _faixa_comum(df_ts, [PLACA_LIMPA["temperatura"], PLACA_SUJA["temperatura"]]),
-    }
-    # Garante que a curva de potência ESPERADA também caiba no gráfico
-    esperada_max = (pmax * df_ts["field7"].clip(lower=0) / IRRADIANCIA_STC).max()
-    if faixas["potencia"] and pd.notna(esperada_max):
-        faixas["potencia"][1] = max(faixas["potencia"][1], float(esperada_max) * 1.08)
+    # 🎯 Resultado do teste: o sistema acertou o estado real de cada placa?
+    julgadas = [(p, a) for p, a in ((PLACA_LIMPA, a_limpa), (PLACA_SUJA, a_suja)) if a["veredito"] != "SEM SOL"]
+    if not julgadas:
+        st.markdown(
+            '<div class="decision-box warn">🌙 Sem sol suficiente no período para julgar as placas. '
+            'Escolha um período com leituras durante o dia.</div>', unsafe_allow_html=True)
+    else:
+        acertos = sum(a["veredito"] == p["esperado"] for p, a in julgadas)
+        cls = "ok" if acertos == len(julgadas) else "alert"
+        st.markdown(
+            f'<div class="decision-box {cls}">🎯 Resultado do teste: o sistema classificou corretamente '
+            f'{acertos} de {len(julgadas)} placa(s).</div>', unsafe_allow_html=True)
+
+    # Mesma escala Y nos dois gráficos (inclui a curva esperada)
+    esperada = pmax * df_ts["field7"].clip(lower=0) / IRRADIANCIA_STC
+    valores = pd.concat([df_ts[PLACA_LIMPA["potencia"]], df_ts[PLACA_SUJA["potencia"]], esperada]).dropna()
+    faixa_pot = [0, max(1.0, float(valores.max()) * 1.08)] if not valores.empty else None
 
     # ⬅️ LIMPA | SUJA ➡️
     col_esq, col_dir = st.columns(2, gap="large")
     with col_esq:
-        _coluna_placa(df_ts, ultima, PLACA_LIMPA, faixas, "limpa", pmax, custo_limpeza)
+        _coluna_julgamento(df_ts, PLACA_LIMPA, a_limpa, pmax, custo_limpeza, faixa_pot)
     with col_dir:
-        _coluna_placa(df_ts, ultima, PLACA_SUJA, faixas, "suja", pmax, custo_limpeza)
+        _coluna_julgamento(df_ts, PLACA_SUJA, a_suja, pmax, custo_limpeza, faixa_pot)
 
     st.markdown("---")
-
-    # 📉 Perda por sujeira — razão P_suja / P_limpa
-    st.subheader("📉 Perda por Sujeira — razão P_suja / P_limpa")
-    st.caption(
-        "As duas placas recebem o mesmo sol, então a razão entre as potências mede "
-        "diretamente a perda causada pela sujeira, sem depender da calibração do "
-        f"sensor de irradiância. Leituras com placa limpa abaixo de {POT_MIN_RAZAO} W "
-        "(noite/amanhecer) são ignoradas."
-    )
-
-    d = df_ts[["timestamp", PLACA_SUJA["potencia"], PLACA_LIMPA["potencia"]]].dropna()
-    d = d[d[PLACA_LIMPA["potencia"]] > POT_MIN_RAZAO].copy()
-
-    if d.empty:
-        st.info("Sem leituras com sol suficiente no período para calcular a razão.")
-        return
-
-    d["razao"] = d[PLACA_SUJA["potencia"]] / d[PLACA_LIMPA["potencia"]]
-    d["perda_pct"] = (1 - d["razao"]) * 100
-
-    e_limpa = energia_periodo_wh(df_ts, PLACA_LIMPA["potencia"])
-    e_suja = energia_periodo_wh(df_ts, PLACA_SUJA["potencia"])
-    perda_energia_pct = (1 - e_suja / e_limpa) * 100 if e_limpa > 0 else None
-
-    perda_atual = d["perda_pct"].iloc[-1]
-    cor_atual = "#ef4444" if perda_atual > LIMIAR_SUJEIRA else "#22c55e"
-
-    r1, r2, r3, r4 = st.columns(4)
-    with r1:
-        card("Razão atual", f"{d['razao'].iloc[-1]:.2f}", "P_suja / P_limpa", "#67e8f9")
-    with r2:
-        card("Perda atual", f"{perda_atual:.1f}", "%", cor_atual)
-    with r3:
-        if perda_energia_pct is not None:
-            cor_p = "#ef4444" if perda_energia_pct > LIMIAR_SUJEIRA else "#22c55e"
-            card("Perda no período", f"{perda_energia_pct:.1f}", "% da energia", cor_p)
-        else:
-            card("Perda no período", "—", "% da energia")
-    with r4:
-        card("Energia perdida", f"{max(0, e_limpa - e_suja):.2f}", "Wh no período", "#f87171")
-
-    fig_r = go.Figure(go.Scatter(
-        x=d["timestamp"], y=d["perda_pct"], mode="lines",
-        line=dict(color="#f87171", width=2), name="Perda (%)",
-    ))
-    fig_r.add_hline(
-        y=LIMIAR_SUJEIRA, line_dash="dash", line_color="#facc15",
-        annotation_text=f"Limiar ({LIMIAR_SUJEIRA}%)",
-        annotation_position="top right", annotation_font_color="#facc15",
-    )
-    fig_r.update_layout(**LAY, title="Perda da placa suja em relação à limpa (%)", yaxis_title="%")
-    st.plotly_chart(fig_r, use_container_width=True, key="cmp_razao")
+    with st.expander("🧽 Registro de limpeza — zerar contador para um novo teste"):
+        _secao_registro_limpeza(custo_limpeza)
 
 # ============================================================================
 # 🎯 FUNÇÃO PRINCIPAL
@@ -1428,7 +1365,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 2.5 — diagnóstico por placa</div>',
+        'margin:6px 0">🟢 versão 2.6 — julgamento limpa/suja por placa</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
