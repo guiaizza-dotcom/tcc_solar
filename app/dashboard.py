@@ -48,6 +48,7 @@ st.markdown(pwa_html, unsafe_allow_html=True)
 # ⚙️ CONSTANTES E CONFIGURAÇÃO
 # ============================================================================
 
+APP_URL = "https://tcc-ml-vbe-solar.streamlit.app/"  # endereço público do app
 SHEET_ID = "19jK526ZMo0BPvZ6sW3U5O0faVK16rsejEkpyYMBZ7Ec"
 CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSuKaaNCw3461krN9wiYOhL01NISccPj1VMKRx6s3NdeK1G7Lj7G7tYs7C3Tr_oLcOwMCsLhsgTHrOc/pub?output=csv"
 CRED_FILE = "credenciais.json"
@@ -718,7 +719,8 @@ def render_aba_email():
                 sucesso, detalhe = enviar_email_gmail(
                     remetente, senha_app, emails_validos,
                     "TCC Solar - Teste de notificação",
-                    "Esta é uma mensagem de teste enviada manualmente pela aba de e-mail do TCC Solar.",
+                    "Esta é uma mensagem de teste enviada manualmente pela aba de e-mail do TCC Solar.\n\n"
+                    f"Abra o painel: {APP_URL}",
                 )
             if sucesso:
                 st.success(
@@ -751,7 +753,7 @@ def verificar_e_enviar_alerta_email(compensa_limpar: bool, mensagem_alerta: str)
         sucesso, _ = enviar_email_gmail(
             remetente, senha_app, emails_validos,
             "TCC Solar - Limpeza da placa recomendada",
-            mensagem_alerta,
+            f"{mensagem_alerta}\n\nAbra o painel: {APP_URL}",
         )
         st.session_state["ultimo_alerta_enviado"] = True
         if sucesso:
