@@ -63,6 +63,11 @@ EMAIL_ALERTA_PADRAO = "bittoleoguio@gmail.com"  # usado só se a planilha ainda 
 AGUA_LITROS_PADRAO        = 5.0    # litros de água por limpeza
 AGUA_PRECO_M3_PADRAO      = 5.50   # R$ por m³ (veja na sua conta de água/saneamento)
 
+# --- 📍 Local das placas (usado só na previsão reserva do Open-Meteo) ---
+# ⚠️ CONFIRME: valores padrão = Indaiatuba-SP (UniMAX). Troque pelas coordenadas da bancada.
+LATITUDE  = -23.0903
+LONGITUDE = -47.2181
+
 # --- ThingSpeak (Minha Placa ao Vivo) ---
 THINGSPEAK_CHANNEL_ID = "3337625"
 THINGSPEAK_READ_API_KEY = "I7LHJFAFLIN4J5HJ"
@@ -282,6 +287,8 @@ def carregar_sheets():
             cl = col.lower()
             if "data" in cl or "hora" in cl:
                 rename[col] = "timestamp"
+            elif "chuv" in cl or "precip" in cl:
+                rename[col] = "chuva"
             elif "nuven" in cl:
                 rename[col] = "nuvens_pct"
             elif "temp" in cl:
@@ -299,7 +306,7 @@ def carregar_sheets():
             df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
 
         # Converter colunas numéricas
-        for col in ["nuvens_pct", "temp_ambiente", "irradiancia", "geracao_estimada"]:
+        for col in ["nuvens_pct", "temp_ambiente", "irradiancia", "geracao_estimada", "chuva"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", "."), errors="coerce").fillna(0)
 
@@ -1386,6 +1393,253 @@ def render_comparacao(custo_limpeza, pmax):
             _coluna_julgamento(df, placa, a, pmax, custo_limpeza, faixa_pot, origem, agora)
 
 # ============================================================================
+# 🌤️ ABA: PREVISÃO — diagnóstico das placas + medido (passado) x previsto (futuro)
+# ============================================================================
+# • Diagnóstico das duas placas: mesmo critério da aba Comparação (datasheet,
+#   desde a última limpeza de cada placa).
+# • Gráfico de geração: para TRÁS só o que foi MEDIDO (ThingSpeak); para FRENTE
+#   só a PREVISÃO (irradiação prevista pela API, gravada na planilha → faixa do
+#   datasheet 20–25 W × G/1000).
+# • Gráfico de chuva: para trás o que foi registrado no canal Open-Meteo do
+#   ThingSpeak; para frente a previsão.
+
+@st.cache_data(ttl=1800)
+def buscar_previsao_openmeteo(dias=3):
+    """
+    Previsão horária direto da API Open-Meteo (gratuita, sem chave) — usada só
+    como RESERVA, quando a planilha não tiver linhas futuras ou coluna de chuva.
+    """
+    try:
+        resp = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": LATITUDE, "longitude": LONGITUDE,
+                "hourly": "shortwave_radiation,precipitation_probability,precipitation",
+                "forecast_days": int(dias) + 1, "timezone": "America/Sao_Paulo",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        h = resp.json().get("hourly", {})
+        return pd.DataFrame({
+            "timestamp": pd.to_datetime(h.get("time", [])),
+            "irradiancia": pd.to_numeric(h.get("shortwave_radiation", []), errors="coerce"),
+            "chuva": pd.to_numeric(h.get("precipitation_probability", []), errors="coerce"),
+            "chuva_mm": pd.to_numeric(h.get("precipitation", []), errors="coerce"),
+        })
+    except Exception:
+        return pd.DataFrame()
+
+def _previsao_futura(df_sheets, agora, dias):
+    """
+    Linhas de previsão de AGORA em diante (até 'dias' à frente).
+    Fonte principal: planilha (API gravada no Google Sheets). Reserva: Open-Meteo.
+    Devolve (df, fonte_irradiacao, fonte_chuva).
+    """
+    fim = agora + pd.Timedelta(days=dias)
+    fut = pd.DataFrame()
+    if not df_sheets.empty and "timestamp" in df_sheets:
+        fut = df_sheets[(df_sheets["timestamp"] > agora) & (df_sheets["timestamp"] <= fim)].copy()
+
+    om = None
+    fonte_irr = "planilha (API)"
+    if fut.empty or "irradiancia" not in fut:
+        om = buscar_previsao_openmeteo(dias)
+        fut = om[(om["timestamp"] > agora) & (om["timestamp"] <= fim)].copy() if not om.empty else om
+        fonte_irr = "Open-Meteo (reserva)"
+
+    fonte_chuva = "planilha (API)"
+    if fut.empty or "chuva" not in fut or fut["chuva"].isna().all():
+        om = buscar_previsao_openmeteo(dias) if om is None else om
+        if not om.empty and not fut.empty:
+            fut = pd.merge_asof(
+                fut.sort_values("timestamp").drop(columns=["chuva", "chuva_mm"], errors="ignore"),
+                om[["timestamp", "chuva", "chuva_mm"]].sort_values("timestamp"),
+                on="timestamp", direction="nearest", tolerance=pd.Timedelta("90min"),
+            )
+            fonte_chuva = "Open-Meteo"
+        else:
+            fonte_chuva = None
+    return fut.sort_values("timestamp").reset_index(drop=True) if not fut.empty else fut, fonte_irr, fonte_chuva
+
+def _dados_placa_desde_limpeza(placa, pmax, custo_limpeza, hoje):
+    """Leituras e julgamento de UMA placa desde a última limpeza registrada dela."""
+    limpeza = carregar_ultima_limpeza(placa["celula"])
+    inicio = limpeza or datetime.combine(hoje, datetime.min.time())
+    origem = (f"a limpeza de {inicio.strftime('%d/%m %H:%M')}" if limpeza
+              else "hoje 00:00 (nenhuma limpeza registrada)")
+    df = buscar_historico_thingspeak(inicio.date(), hoje)
+    if not df.empty:
+        df = df[df["timestamp"] >= inicio].reset_index(drop=True)
+    if df.empty or len(df) < 2 or "field7" not in df:
+        return None, origem
+    return _avaliar_placa(df, placa, pmax, custo_limpeza), origem
+
+def _linha_agora(fig, agora):
+    """Linha vertical 'agora' (feita com shape + annotation; add_vline com data dá erro em algumas versões do Plotly)."""
+    fig.add_shape(type="line", x0=agora, x1=agora, y0=0, y1=1, yref="paper",
+                  line=dict(color="#e2e8f0", width=1, dash="dot"))
+    fig.add_annotation(x=agora, y=1, yref="paper", text="agora", showarrow=False,
+                       yanchor="bottom", font=dict(color="#e2e8f0", size=11))
+
+def render_previsao(df_sheets, custo_limpeza, pmax):
+    agora = agora_brasil()
+    hoje = agora.date()
+
+    # ------------------------------------------------------------------ 🚦 Diagnóstico
+    st.subheader("🚦 Diagnóstico das placas")
+    st.caption("Mesmo critério da aba Comparação: faixa do datasheet (20–25 W × G/1000), "
+               "contada desde a última limpeza de cada placa.")
+
+    col_esq, col_dir = st.columns(2, gap="large")
+    alertas = []
+    for col, placa in ((col_esq, PLACA_LIMPA), (col_dir, PLACA_SUJA)):
+        a, origem = _dados_placa_desde_limpeza(placa, pmax, custo_limpeza, hoje)
+        with col:
+            if a is None:
+                st.markdown(
+                    f'<div class="veredito" style="background:#1e293b;border-color:#64748b">'
+                    f'<div class="veredito-placa" style="color:{placa["cor"]}">{placa["emoji"]} {placa["nome"]}</div>'
+                    f'<div class="veredito-label" style="color:#cbd5e1">⏳ AGUARDANDO</div>'
+                    f'<div class="veredito-sub">ainda não há leituras desde {origem}</div></div>',
+                    unsafe_allow_html=True,
+                )
+                continue
+            _bloco_veredito(placa, a)
+            _bloco_requisitos(a, custo_limpeza)
+            st.caption(f"📍 Desde {origem} — {a['n_sol']} leituras com sol.")
+            if a["compensa"]:
+                alertas.append(f"{placa['nome']}: {a['perda_pct']:.1f}% abaixo do mínimo do datasheet, "
+                               f"perda {_fmt_rs(a['perda_dia'])}/dia ≥ custo {_fmt_rs(custo_limpeza)}.")
+
+    # 📧 Alerta automático por e-mail quando alguma placa compensa limpar
+    if alertas:
+        verificar_e_enviar_alerta_email(True, "🚨 LIMPEZA RECOMENDADA\n\n" + "\n".join(alertas))
+    else:
+        verificar_e_enviar_alerta_email(False, "")
+
+    st.markdown("---")
+
+    # ------------------------------------------------------------------ ⚙️ Janela
+    j1, j2, j3 = st.columns([1, 1, 1])
+    with j1:
+        dias_hist = st.slider("Histórico medido (dias para trás)", 1, 7, 3, key="prev_dias_hist")
+    with j2:
+        dias_prev = st.slider("Previsão (dias para frente)", 1, 7, 3, key="prev_dias_fut")
+    with j3:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        if st.button("🔄 Atualizar", use_container_width=True, key="btn_prev_atualizar"):
+            st.cache_data.clear()
+            st.rerun()
+
+    inicio_hist = agora - pd.Timedelta(days=dias_hist)
+    with st.spinner("Buscando medições e previsão..."):
+        hist = buscar_historico_thingspeak(inicio_hist.date(), hoje)
+        if not hist.empty:
+            hist = hist[(hist["timestamp"] >= inicio_hist) & (hist["timestamp"] <= agora)]
+        fut, fonte_irr, fonte_chuva = _previsao_futura(df_sheets, agora, dias_prev)
+        chuva_hist = buscar_historico_thingspeak(
+            inicio_hist.date(), hoje, channel_id=THINGSPEAK_CHANNEL_ID_METEO,
+            api_key=THINGSPEAK_READ_API_KEY_METEO, campos=THINGSPEAK_CAMPOS_METEO,
+        )
+        if not chuva_hist.empty:
+            chuva_hist = chuva_hist[(chuva_hist["timestamp"] >= inicio_hist) & (chuva_hist["timestamp"] <= agora)]
+
+    # Faixa prevista do datasheet a partir da irradiação prevista
+    if not fut.empty and "irradiancia" in fut:
+        g = fut["irradiancia"].clip(lower=0) / IRRADIANCIA_STC
+        fut["p_min"] = pmax * g
+        fut["p_max"] = (pmax + DS_TOLERANCIA_W) * g
+
+    # ------------------------------------------------------------------ 📅 Resumo dos próximos dias
+    if not fut.empty and "p_min" in fut:
+        st.subheader("📅 Próximos dias")
+        f = fut.copy()
+        f["dt_h"] = f["timestamp"].diff().dt.total_seconds().div(3600).bfill().clip(upper=1.0).fillna(1.0)
+        f["dia"] = f["timestamp"].dt.date
+        f["e_min"] = f["p_min"] * f["dt_h"]
+        f["e_max"] = f["p_max"] * f["dt_h"]
+        if "chuva" not in f:
+            f["chuva"] = float("nan")
+        resumo = f.groupby("dia").agg(e_min=("e_min", "sum"), e_max=("e_max", "sum"),
+                                      chuva=("chuva", "max")).head(4)
+        cols = st.columns(len(resumo))
+        for c, (dia, r) in zip(cols, resumo.iterrows()):
+            chuva_txt = f"🌧️ chuva até {r['chuva']:.0f}%" if pd.notna(r["chuva"]) else "chuva: sem dado"
+            cor = "#38bdf8" if pd.notna(r["chuva"]) and r["chuva"] >= 60 else "#facc15"
+            with c:
+                card(f"{['seg','ter','qua','qui','sex','sáb','dom'][dia.weekday()]} {dia.strftime('%d/%m')}", f"{r['e_min']:.0f}–{r['e_max']:.0f}", f"Wh previstos · {chuva_txt}", cor)
+        st.caption("Dias com chuva ≥ 60% aparecem em azul: a chuva pode lavar a placa naturalmente — "
+                   "vale esperar antes de gastar água na limpeza.")
+
+    # ------------------------------------------------------------------ ⚡ Gráfico de geração
+    st.subheader("⚡ Geração: medida (para trás) × prevista (para frente)")
+    fig = go.Figure()
+    if not hist.empty:
+        for placa in (PLACA_LIMPA, PLACA_SUJA):
+            fig.add_trace(go.Scatter(
+                x=hist["timestamp"], y=hist[placa["potencia"]], mode="lines",
+                name=f"{placa['nome']} — medida", line=dict(color=placa["cor"], width=2),
+            ))
+    if not fut.empty and "p_min" in fut:
+        fig.add_trace(go.Scatter(
+            x=fut["timestamp"], y=fut["p_max"], name="Prevista máx. (25 W)",
+            line=dict(color="rgba(250,204,21,0.6)", width=1, dash="dot"),
+        ))
+        fig.add_trace(go.Scatter(
+            x=fut["timestamp"], y=fut["p_min"], name="Prevista mín. (20 W)",
+            fill="tonexty", fillcolor="rgba(250,204,21,0.15)",
+            line=dict(color="#facc15", width=2, dash="dash"),
+        ))
+    _linha_agora(fig, agora)
+    fig.update_layout(**LAY, title="Potência (W)", yaxis_title="W", height=380)
+    fig.update_xaxes(range=[inicio_hist, agora + pd.Timedelta(days=dias_prev)])
+    st.plotly_chart(fig, use_container_width=True, key="prev_geracao")
+
+    avisos = []
+    if hist.empty:
+        avisos.append("sem medições do ThingSpeak no histórico escolhido")
+    if fut.empty or "p_min" not in fut:
+        avisos.append("sem previsão futura de irradiação (a planilha não tem linhas depois de agora "
+                      "e o Open-Meteo não respondeu)")
+    if avisos:
+        st.warning("⚠️ " + "; ".join(avisos) + ".")
+    else:
+        st.caption(f"Medido: canal ThingSpeak {THINGSPEAK_CHANNEL_ID}. Previsão de irradiação: {fonte_irr}.")
+
+    # ------------------------------------------------------------------ 🌧️ Gráfico de chuva
+    st.subheader("🌧️ Chuva: registrada (para trás) × prevista (para frente)")
+    fig_c = go.Figure()
+    if not chuva_hist.empty and "field3" in chuva_hist:
+        fig_c.add_trace(go.Bar(
+            x=chuva_hist["timestamp"], y=chuva_hist["field3"], name="Chance registrada (%)",
+            marker_color="rgba(148,163,184,0.55)",
+        ))
+    if not fut.empty and "chuva" in fut:
+        fig_c.add_trace(go.Bar(
+            x=fut["timestamp"], y=fut["chuva"], name="Chance prevista (%)",
+            marker_color="#38bdf8",
+        ))
+    tem_mm = not fut.empty and "chuva_mm" in fut and fut["chuva_mm"].notna().any()
+    if tem_mm:
+        fig_c.add_trace(go.Scatter(
+            x=fut["timestamp"], y=fut["chuva_mm"], name="Chuva prevista (mm)",
+            mode="lines", line=dict(color="#818cf8", width=2), yaxis="y2",
+        ))
+    _linha_agora(fig_c, agora)
+    lay_c = {**LAY, "title": "Chance de chuva (%)", "height": 300, "bargap": 0.1}
+    lay_c["yaxis"] = dict(title="%", range=[0, 100], gridcolor="#1e293b", linecolor="#334155")
+    if tem_mm:
+        lay_c["yaxis2"] = dict(title="mm", overlaying="y", side="right", showgrid=False)
+    fig_c.update_layout(**lay_c)
+    fig_c.update_xaxes(range=[inicio_hist, agora + pd.Timedelta(days=dias_prev)])
+    st.plotly_chart(fig_c, use_container_width=True, key="prev_chuva")
+    if fonte_chuva:
+        st.caption(f"Registrada: canal ThingSpeak {THINGSPEAK_CHANNEL_ID_METEO} (Open-Meteo). Prevista: {fonte_chuva}.")
+    else:
+        st.caption("Sem previsão de chuva disponível agora.")
+
+# ============================================================================
 # 🎯 FUNÇÃO PRINCIPAL
 # ============================================================================
 
@@ -1397,7 +1651,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 3.0 — julgamento pelo datasheet (20–25 W)</div>',
+        'margin:6px 0">🟢 versão 3.1 — aba Previsão (medido × previsto + chuva)</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
@@ -1442,14 +1696,6 @@ def main():
 
         st.markdown("---")
 
-        # Filtro de período
-        if not df.empty and "timestamp" in df.columns:
-            st.subheader("📅 Período")
-            dmin = df["timestamp"].min().date()
-            dmax = df["timestamp"].max().date()
-            d1 = st.date_input("De:", value=dmin, min_value=dmin, max_value=dmax)
-            d2 = st.date_input("Até:", value=dmax, min_value=dmin, max_value=dmax)
-
         st.markdown("---")
         st.markdown("**TCC Solar**\n- Dados via API climática\n- Python + Streamlit")
         st.markdown("---")
@@ -1464,7 +1710,7 @@ def main():
     mostrar_botao_teste_notificacao()
 
     tab1, tab2, tab_cmp, tab3 = st.tabs(
-        ["📊 Dashboard", "☀️ Minha Placa ao Vivo", "⚖️ Comparação", "📧 E-mail"]
+        ["🌤️ Previsão", "☀️ Minha Placa ao Vivo", "⚖️ Comparação", "📧 E-mail"]
     )
 
     with tab2:
@@ -1477,179 +1723,7 @@ def main():
         render_aba_email()
 
     with tab1:
-        # Verificar se há dados
-        if df.empty:
-            st.warning("⚠️ Sem dados da planilha.")
-            st.stop()
-
-        # Filtrar por período
-        mask = (df["timestamp"].dt.date >= d1) & (df["timestamp"].dt.date <= d2)
-        df = df[mask].copy()
-
-        if df.empty:
-            st.warning("Nenhum dado para o período selecionado.")
-            st.stop()
-
-        # Análise (usa o custo de limpeza calculado a partir da água)
-        an = analisar(df, potencia_cliente, custo_limpeza_atual)
-        ultima = df.iloc[-1]
-        ult_an = an.iloc[-1]
-
-        # ============================================================================
-        # 🔔 VERIFICAR SE COMPENSA LIMPAR E MOSTRAR NOTIFICAÇÃO
-        # ============================================================================
-
-        if ult_an["compensa_limpar"]:
-            perda = ult_an["perda_percentual"]
-            perda_diaria = ult_an["perda_diaria_est"]
-            msg_alerta = (f"🚨 LIMPEZA NECESSÁRIA!\n\nPerda média: R${perda_diaria:.2f}/dia — "
-                          f"maior ou igual ao custo de limpeza (R${custo_limpeza_atual:.2f}). COMPENSA LIMPAR!")
-            st.error(msg_alerta)
-            verificar_e_enviar_alerta_email(True, msg_alerta)
-        else:
-            verificar_e_enviar_alerta_email(False, "")
-
-        # Info box
-        st.info(
-            f"Calculando para uma placa de {potencia_cliente:.0f}W — Geração máxima esperada: "
-            f"{potencia_cliente * EFICIENCIA:.1f}W em condições ideais. "
-            f"Custo de limpeza considerado: R${custo_limpeza_atual:.2f}."
-        )
-
-        # Diagnóstico atual
-        st.subheader("Diagnóstico Atual")
-        cls = "alert" if ult_an["compensa_limpar"] else ("warn" if ult_an["indicativo_sujeira"] else "ok")
-        st.markdown(f'<div class="decision-box {cls}">{ult_an["mensagem_status"]}</div>', unsafe_allow_html=True)
-
-        # Indicadores em tempo real
-        st.subheader("Indicadores em Tempo Real")
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1:
-            card("Irradiância", f"{ultima.get('irradiancia', 0):.0f}", "W/m²", "#facc15")
-        with c2:
-            card("Geração Prevista", f"{ult_an['geracao_prevista']:.1f}", "W", "#60a5fa")
-        with c3:
-            card("Geração Real", f"{ult_an['geracao_real']:.1f}", "W", "#f59e0b")
-        with c4:
-            cor = "#ef4444" if ult_an["perda_percentual"] > LIMIAR_SUJEIRA else "#22c55e"
-            card("Perda Estimada", f"{ult_an['perda_percentual']:.1f}", "%", cor)
-        with c5:
-            card("Temperatura", f"{ultima.get('temp_ambiente', 0):.1f}", "°C", "#34d399")
-
-        c6, c7, c8, c9, c10 = st.columns(5)
-        with c6:
-            card("Nuvens", f"{ultima.get('nuvens_pct', 0):.0f}", "%", "#94a3b8")
-        with c7:
-            card("Perda/Medição", f"R$ {ult_an['perda_financeira']:.4f}", "", "#f87171")
-        with c8:
-            card("Perda Diária", f"R$ {ult_an['perda_diaria_est']:.2f}", "média/dia", "#fb923c")
-        with c9:
-            card("Custo Limpeza", f"R$ {custo_limpeza_atual:.2f}", "água", "#a78bfa")
-        with c10:
-            payback = ult_an["dias_payback"]
-            payback_txt = f"{payback:.1f}" if payback is not None else "—"
-            card("Paga limpeza em", payback_txt, "dias", "#67e8f9")
-
-        st.markdown("---")
-
-        # Gráfico: Geração Prevista vs Real
-        st.subheader("Geração Prevista vs Real")
-        fig1 = go.Figure()
-        fig1.add_trace(go.Scatter(
-            x=df["timestamp"], y=an["geracao_prevista"],
-            name="Prevista (API)", mode="lines",
-            line=dict(color="#60a5fa", width=2, dash="dash")
-        ))
-        fig1.add_trace(go.Scatter(
-            x=df["timestamp"], y=an["geracao_real"],
-            name="Real (sua placa)", mode="lines",
-            line=dict(color="#f59e0b", width=2)
-        ))
-        fig1.add_trace(go.Scatter(
-            x=pd.concat([df["timestamp"], df["timestamp"][::-1]]),
-            y=pd.concat([an["geracao_prevista"], an["geracao_real"][::-1]]),
-            fill="toself", fillcolor="rgba(239,68,68,0.12)",
-            line=dict(color="rgba(0,0,0,0)"),
-            name="Área de perda", hoverinfo="skip"
-        ))
-        fig1.update_layout(**LAY, title=f"Geração Prevista (API) vs Real (placa {potencia_cliente:.0f}W)", yaxis_title="W")
-        st.plotly_chart(fig1, use_container_width=True)
-
-        ca, cb = st.columns(2)
-
-        with ca:
-            st.subheader("Irradiância Solar")
-            fig2 = go.Figure(go.Scatter(
-                x=df["timestamp"], y=df["irradiancia"],
-                fill="tozeroy", fillcolor="rgba(250,204,21,0.15)",
-                line=dict(color="#facc15", width=2), name="Irradiância"
-            ))
-            fig2.update_layout(**LAY, title="Irradiância (W/m²)", yaxis_title="W/m²")
-            st.plotly_chart(fig2, use_container_width=True)
-
-        with cb:
-            st.subheader("Temperatura e Nuvens")
-            fig3 = go.Figure()
-            fig3.add_trace(go.Scatter(
-                x=df["timestamp"], y=df["temp_ambiente"],
-                name="Temperatura (°C)", mode="lines",
-                line=dict(color="#34d399", width=2)
-            ))
-            if "nuvens_pct" in df.columns:
-                fig3.add_trace(go.Bar(
-                    x=df["timestamp"], y=df["nuvens_pct"],
-                    name="Nuvens (%)", opacity=0.4,
-                    marker_color="#94a3b8", yaxis="y2"
-                ))
-            # FIX: monta o layout num dicionário único ao invés de passar
-            # yaxis/yaxis2 junto com **LAY (que já tem "yaxis"), o que causava
-            # "got multiple values for keyword argument 'yaxis'"
-            layout_temp = {**LAY, "title": "Temperatura e Nuvens"}
-            layout_temp["yaxis"] = dict(title="°C", gridcolor="#1e293b", linecolor="#334155")
-            layout_temp["yaxis2"] = dict(title="%", overlaying="y", side="right", gridcolor="#1e293b", linecolor="#334155")
-            fig3.update_layout(**layout_temp)
-            st.plotly_chart(fig3, use_container_width=True)
-
-        # Gráfico: Perda por Sujeira
-        st.subheader("Perda Estimada por Sujeira")
-        fig4 = go.Figure(go.Bar(
-            x=df["timestamp"], y=an["perda_percentual"],
-            marker_color=["#ef4444" if v > LIMIAR_SUJEIRA else "#22c55e" for v in an["perda_percentual"]]
-        ))
-        fig4.add_hline(
-            y=LIMIAR_SUJEIRA, line_dash="dash", line_color="#facc15",
-            annotation_text=f"Limiar ({LIMIAR_SUJEIRA}%)",
-            annotation_position="top right", annotation_font_color="#facc15"
-        )
-        fig4.update_layout(**LAY, title="Perda por Sujeira (%)", yaxis_title="%")
-        st.plotly_chart(fig4, use_container_width=True)
-
-        st.markdown("---")
-
-        # Análise econômica
-        st.subheader("Análise Econômica do Período")
-        perda_kwh = an["energia_perdida_kwh"].sum()   # energia perdida real (kWh), intervalo real
-        perda_r   = an["perda_financeira"].sum()       # R$ perdidos no período
-        perda_dia = ult_an["perda_diaria_est"]         # R$/dia médio
-        e1, e2, e3, e4 = st.columns(4)
-        with e1:
-            card("Energia Perdida", f"{perda_kwh:.4f}", "kWh no período")
-        with e2:
-            card("Perda Total", f"R$ {perda_r:.3f}", "no período")
-        with e3:
-            card("Perda Média", f"R$ {perda_dia:.2f}", "por dia")
-        with e4:
-            decisao = "SIM" if ult_an["compensa_limpar"] else "NÃO"
-            cor_dec = "#ef4444" if ult_an["compensa_limpar"] else "#22c55e"
-            card("Compensa Limpar?", decisao, f"custo R$ {custo_limpeza_atual:.2f}", cor_dec)
-
-        st.markdown("---")
-
-        # Tabela de dados
-        with st.expander("📋 Ver dados da planilha"):
-            st.dataframe(df.sort_values("timestamp", ascending=False), use_container_width=True)
-
-        st.caption("TCC Solar | Python + Streamlit + Google Sheets")
+        render_previsao(df, custo_limpeza_atual, potencia_cliente)
 
 
 # ============================================================================
