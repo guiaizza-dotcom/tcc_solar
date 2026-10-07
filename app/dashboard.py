@@ -245,22 +245,22 @@ def _abrir_planilha():
         creds = Credentials.from_service_account_file(CRED_FILE, scopes=scopes)
     return gspread.authorize(creds).open_by_key(SHEET_ID).sheet1
 
-def gravar_ultima_limpeza(data_hora):
-    """Grava a data/hora (horário de Brasília) da última limpeza na planilha
-    (célula J2). Fica salva entre sessões e reinicializações do app."""
+def gravar_ultima_limpeza(data_hora, celula="J2"):
+    """Grava a data/hora (horário de Brasília) da última limpeza de UMA placa na
+    planilha (J2 = Placa Limpa, K2 = Placa Suja). Persiste entre sessões."""
     try:
-        _abrir_planilha().update("J2", [[data_hora.strftime("%Y-%m-%d %H:%M:%S")]])
+        _abrir_planilha().update(celula, [[data_hora.strftime("%Y-%m-%d %H:%M:%S")]])
         return True
     except Exception as e:
         st.error(f"Erro ao gravar a data da limpeza na planilha: {e}")
         return False
 
 @st.cache_data(ttl=30)
-def carregar_ultima_limpeza():
-    """Lê a data/hora da última limpeza (célula J2). Retorna None se ainda não
-    houver nenhuma limpeza registrada ou em caso de erro."""
+def carregar_ultima_limpeza(celula="J2"):
+    """Lê a data/hora da última limpeza de UMA placa (J2 = Placa Limpa,
+    K2 = Placa Suja). Retorna None se não houver registro ou em caso de erro."""
     try:
-        valor = _abrir_planilha().acell("J2").value
+        valor = _abrir_planilha().acell(celula).value
         if not valor or not str(valor).strip():
             return None
         ts = pd.to_datetime(str(valor).strip(), errors="coerce")
@@ -1021,9 +1021,9 @@ def render_placa_ao_vivo():
 
 # Fields de cada placa no canal ThingSpeak (os nomes são só rótulos das bancadas)
 PLACA_LIMPA = {"nome": "Placa Limpa", "emoji": "🟢", "cor": "#22c55e",
-               "potencia": "field4"}
+               "potencia": "field4", "celula": "J2"}
 PLACA_SUJA  = {"nome": "Placa Suja",  "emoji": "🟠", "cor": "#f59e0b",
-               "potencia": "field1"}
+               "potencia": "field1", "celula": "K2"}
 
 # Abaixo dessa irradiação (noite/amanhecer/entardecer) a comparação vira ruído,
 # então essas leituras não entram no julgamento.
@@ -1159,10 +1159,49 @@ def _bloco_requisitos(a, custo_limpeza):
         unsafe_allow_html=True,
     )
 
-def _coluna_julgamento(df, placa, a, pmax, custo_limpeza, faixa_pot):
-    """Uma coluna completa (veredito + números + requisitos + 1 gráfico) para UMA placa."""
+def _controles_limpeza(placa, agora):
+    """Botões para registrar a limpeza DESTA placa — o julgamento recomeça a partir daí."""
+    sufixo = placa["potencia"]
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("🧽 Limpei agora", use_container_width=True, key=f"btn_limpar_{sufixo}"):
+            if gravar_ultima_limpeza(agora_brasil(), placa["celula"]):
+                st.cache_data.clear()
+                st.rerun()
+    with b2:
+        manual = st.checkbox("Limpei em outro horário", key=f"chk_limpar_{sufixo}")
+    if manual:
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            data_l = st.date_input("Data", value=agora.date(), max_value=agora.date(), key=f"data_limpar_{sufixo}")
+        with m2:
+            hora_l = st.time_input("Hora", value=agora.time().replace(second=0, microsecond=0), key=f"hora_limpar_{sufixo}")
+        with m3:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            if st.button("Salvar", use_container_width=True, key=f"btn_salvar_limpar_{sufixo}"):
+                if gravar_ultima_limpeza(datetime.combine(data_l, hora_l), placa["celula"]):
+                    st.cache_data.clear()
+                    st.rerun()
+
+def _coluna_julgamento(df, placa, a, pmax, pmax_nominal, custo_limpeza, faixa_pot, origem, agora):
+    """Uma coluna completa (veredito + limpeza + números + requisitos + 1 gráfico) para UMA placa."""
     cor = placa["cor"]
+
+    if a is None:
+        st.markdown(
+            f'<div class="veredito" style="background:#1e293b;border-color:#64748b">'
+            f'<div class="veredito-placa" style="color:{cor}">{placa["emoji"]} {placa["nome"]}</div>'
+            f'<div class="veredito-label" style="color:#cbd5e1">⏳ AGUARDANDO</div>'
+            f'<div class="veredito-sub">ainda não há leituras desde {origem}</div></div>',
+            unsafe_allow_html=True,
+        )
+        _controles_limpeza(placa, agora)
+        return
+
     _bloco_veredito(placa, a)
+    sol = df[df["field7"] >= IRRAD_MIN_JULGAMENTO]
+    st.caption(f"📍 Julgando desde **{origem}** — {len(sol)} leituras com sol.")
+    _controles_limpeza(placa, agora)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1171,9 +1210,15 @@ def _coluna_julgamento(df, placa, a, pmax, custo_limpeza, faixa_pot):
         card("Potência esperada", _fmt(a["pot_esperada"]), "W (Pmax × fator × G/1000)", "#facc15")
     c3, c4 = st.columns(2)
     with c3:
-        card("Energia gerada", _fmt(a["e_real"], 2), "Wh no período", cor)
+        card("Energia gerada", _fmt(a["e_real"], 2), "Wh desde o início do julgamento", cor)
     with c4:
-        card("Energia esperada", _fmt(a["e_esperada"], 2), "Wh no período", "#facc15")
+        card("Energia esperada", _fmt(a["e_esperada"], 2), "Wh desde o início do julgamento", "#facc15")
+
+    # Desempenho em relação ao nominal puro — ajuda a escolher o fator
+    e_nom = float((pmax_nominal * sol["field7"] / IRRADIANCIA_STC).sum())
+    if e_nom > 0:
+        desemp = sol[placa["potencia"]].clip(lower=0).sum() / e_nom
+        st.caption(f"Desempenho observado: {desemp:.0%} do nominal ({pmax_nominal:.0f} W × G_sensor/1000).")
 
     _bloco_requisitos(a, custo_limpeza)
 
@@ -1193,180 +1238,110 @@ def _coluna_julgamento(df, placa, a, pmax, custo_limpeza, faixa_pot):
         fig.update_yaxes(range=faixa_pot)
     st.plotly_chart(fig, use_container_width=True, key=f"cmp_pot_{placa['potencia']}")
 
-def _secao_registro_limpeza(custo_limpeza):
-    """
-    Registro da última limpeza (zera o contador para um novo teste) e a perda da
-    placa suja em relação à limpa acumulada desde então.
-    A cada leitura: perda = max(0, P_limpa − P_suja) × intervalo real (≤ 30 min).
-    """
-    agora = agora_brasil()
-    ultima_limpeza = carregar_ultima_limpeza()
-
-    cb1, cb2 = st.columns(2)
-    with cb1:
-        if st.button("🧽 Registrar limpeza agora (zerar)", use_container_width=True, key="btn_limpeza_agora"):
-            if gravar_ultima_limpeza(agora_brasil()):
-                st.cache_data.clear()
-                st.rerun()
-    with cb2:
-        manual = st.checkbox("Limpei em outro horário (informar data/hora)", key="limpeza_manual_chk")
-
-    if manual:
-        m1, m2, m3 = st.columns([1, 1, 1])
-        with m1:
-            data_l = st.date_input("Data da limpeza", value=agora.date(), max_value=agora.date(), key="limpeza_data")
-        with m2:
-            hora_l = st.time_input("Hora da limpeza", value=agora.time().replace(second=0, microsecond=0), key="limpeza_hora")
-        with m3:
-            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-            if st.button("Salvar data da limpeza", use_container_width=True, key="btn_limpeza_manual"):
-                if gravar_ultima_limpeza(datetime.combine(data_l, hora_l)):
-                    st.cache_data.clear()
-                    st.rerun()
-
-    if ultima_limpeza is None:
-        st.info("Nenhuma limpeza registrada ainda. Clique em **Registrar limpeza agora** logo depois de limpar a placa.")
-        return
-
-    dias = max(0.0, (agora - ultima_limpeza).total_seconds() / 86400)
-    st.caption(f"Última limpeza: {ultima_limpeza.strftime('%d/%m/%Y %H:%M')} (horário de Brasília) — há {dias:.1f} dia(s)")
-
-    df = buscar_historico_thingspeak(ultima_limpeza.date(), agora.date())
-    f_l, f_s = PLACA_LIMPA["potencia"], PLACA_SUJA["potencia"]
-    if not df.empty:
-        df = df[df["timestamp"] >= ultima_limpeza][["timestamp", f_l, f_s]].dropna().sort_values("timestamp")
-
-    if df.empty or len(df) < 2:
-        st.info("Ainda não há leituras suficientes desde a última limpeza.")
-        return
-
-    dt_h = df["timestamp"].diff().dt.total_seconds().div(3600).fillna(0).clip(upper=0.5)
-    p_limpa = df[f_l].clip(lower=0)
-    p_suja = df[f_s].clip(lower=0)
-    e_limpa = float((p_limpa * dt_h).sum())
-    perda_wh = float(((p_limpa - p_suja).clip(lower=0) * dt_h).sum())
-    perda_pct = perda_wh / e_limpa * 100 if e_limpa > 0 else 0.0
-    perda_rs = perda_wh / 1000.0 * TARIFA_KWH
-
-    k1, k2, k3 = st.columns(3)
-    with k1:
-        card("Desde a limpeza", f"{dias:.1f}", "dias", "#67e8f9")
-    with k2:
-        cor_pct = "#ef4444" if perda_pct > LIMIAR_SUJEIRA else "#22c55e"
-        card("Energia perdida (suja x limpa)", f"{perda_wh:.2f}", f"Wh ({perda_pct:.1f}%)", cor_pct)
-    with k3:
-        card("Perda acumulada", _fmt_rs(perda_rs), f"custo da limpeza {_fmt_rs(custo_limpeza)}", "#fb923c")
-
 def render_comparacao(custo_limpeza, pmax_nominal, fator):
-    # Potência de referência da placa = nominal × fator de desempenho (barra lateral).
-    # A irradiação usada é SEMPRE a do sensor (field7) — nenhuma placa serve de referência.
+    """
+    Aba de julgamento: cada placa (bancada) recebe o veredito LIMPA/SUJA e a decisão
+    de limpeza. Por padrão o julgamento de cada placa começa na SUA última limpeza
+    registrada — limpou, registra, e o processo recomeça do zero a partir dali.
+    A referência é sempre o sensor: P_esperada = Pmax × fator × G_sensor/1000.
+    """
     pmax = pmax_nominal * fator
-    """Aba de julgamento: cada placa recebe o veredito LIMPA/SUJA e a decisão de limpeza."""
-    st.subheader("⚖️ Comparação — Placa Limpa x Placa Suja")
+    agora = agora_brasil()
+    hoje = agora.date()
+
+    st.subheader("⚖️ Comparação — julgamento de cada placa")
     st.caption(
-        "O sistema compara a potência **medida** de cada placa com a potência **esperada** "
-        "(Pmax × fator × G_sensor/1000) e decide se ela está **LIMPA** ou **SUJA** e se a limpeza compensa. "
-        f"Só entram no julgamento leituras com irradiação ≥ {IRRAD_MIN_JULGAMENTO:.0f} W/m²."
+        "Cada placa é comparada com a potência **esperada** pelo sensor de irradiação "
+        "(Pmax × fator × G/1000). O sistema decide se ela está **LIMPA** ou **SUJA** e se a "
+        f"limpeza compensa. Só entram leituras com irradiação ≥ {IRRAD_MIN_JULGAMENTO:.0f} W/m²."
     )
 
-    # 📅 Período (independente da aba "Minha Placa ao Vivo")
-    hoje = agora_brasil().date()
-    if "cmp_data_inicio" not in st.session_state:
-        st.session_state["cmp_data_inicio"] = hoje
-    if "cmp_data_fim" not in st.session_state:
-        st.session_state["cmp_data_fim"] = hoje
-
-    def _definir_periodo_hoje_cmp():
-        d = agora_brasil().date()
-        st.session_state["cmp_data_inicio"] = d
-        st.session_state["cmp_data_fim"] = d
-
-    col_p1, col_p2, col_p3, col_p4 = st.columns([1, 1, 1, 1])
-    with col_p1:
-        data_inicio = st.date_input("De:", key="cmp_data_inicio")
-    with col_p2:
-        data_fim = st.date_input("Até:", key="cmp_data_fim")
-    with col_p3:
-        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        st.button("📆 Só hoje", use_container_width=True, key="btn_cmp_hoje", on_click=_definir_periodo_hoje_cmp)
-    with col_p4:
+    m1, m2 = st.columns([3, 1])
+    with m1:
+        modo = st.radio(
+            "Julgar a partir de:",
+            ["🧽 Última limpeza de cada placa", "📅 Período escolhido"],
+            horizontal=True, key="cmp_modo",
+        )
+    with m2:
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
         if st.button("🔄 Atualizar", use_container_width=True, key="btn_cmp_atualizar"):
             st.cache_data.clear()
             st.rerun()
 
-    if data_inicio > data_fim:
-        st.error("A data 'De' não pode ser depois da data 'Até'.")
-        return
+    desde_limpeza = modo.startswith("🧽")
 
+    if not desde_limpeza:
+        if "cmp_data_inicio" not in st.session_state:
+            st.session_state["cmp_data_inicio"] = hoje
+        if "cmp_data_fim" not in st.session_state:
+            st.session_state["cmp_data_fim"] = hoje
+
+        def _definir_periodo_hoje_cmp():
+            d = agora_brasil().date()
+            st.session_state["cmp_data_inicio"] = d
+            st.session_state["cmp_data_fim"] = d
+
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            data_inicio = st.date_input("De:", key="cmp_data_inicio")
+        with p2:
+            data_fim = st.date_input("Até:", key="cmp_data_fim")
+        with p3:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            st.button("📆 Só hoje", use_container_width=True, key="btn_cmp_hoje", on_click=_definir_periodo_hoje_cmp)
+        if data_inicio > data_fim:
+            st.error("A data 'De' não pode ser depois da data 'Até'.")
+            return
+
+    # 📡 Dados de cada placa: desde a última limpeza dela, ou o período escolhido
+    dados = {}
     with st.spinner("Buscando dados do ThingSpeak..."):
-        df_ts = buscar_historico_thingspeak(data_inicio, data_fim)
+        for placa in (PLACA_LIMPA, PLACA_SUJA):
+            if desde_limpeza:
+                limpeza = carregar_ultima_limpeza(placa["celula"])
+                inicio = limpeza or datetime.combine(hoje, datetime.min.time())
+                origem = (f"a limpeza de {inicio.strftime('%d/%m %H:%M')}" if limpeza
+                          else "hoje 00:00 (nenhuma limpeza registrada)")
+                df = buscar_historico_thingspeak(inicio.date(), hoje)
+                if not df.empty:
+                    df = df[df["timestamp"] >= inicio].reset_index(drop=True)
+            else:
+                origem = f"{data_inicio.strftime('%d/%m')} a {data_fim.strftime('%d/%m')}"
+                df = buscar_historico_thingspeak(data_inicio, data_fim)
+            if df.empty or len(df) < 2 or "field7" not in df:
+                dados[placa["potencia"]] = (pd.DataFrame(), None, origem)
+            else:
+                dados[placa["potencia"]] = (df, _avaliar_placa(df, placa, pmax, custo_limpeza), origem)
 
-    if df_ts.empty:
-        st.warning("⚠️ Sem dados no ThingSpeak para o período selecionado.")
-        return
-
-    ultima = df_ts.iloc[-1]
-    n_sol = int((df_ts["field7"] >= IRRAD_MIN_JULGAMENTO).sum())
-    st.caption(
-        f"Período: {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')} "
-        f"— {len(df_ts)} leituras ({n_sol} com sol) — última: "
-        f"{ultima['timestamp'].strftime('%d/%m/%Y %H:%M:%S')} (horário de Brasília)"
-    )
-
-    # 🌤️ Condições do teste (comuns às duas placas)
+    # 🌤️ Condições do teste (comuns às duas placas) — leitura mais recente disponível
+    df_agora = buscar_historico_thingspeak(hoje, hoje) if desde_limpeza else \
+        max((d[0] for d in dados.values()), key=len)
+    g_agora = df_agora.iloc[-1].get("field7") if not df_agora.empty else None
     t1, t2, t3 = st.columns(3)
     with t1:
-        card("Irradiação (comum às duas)", _fmt(ultima.get("field7"), 0), "W/m² agora", "#facc15")
+        card("Irradiação do sensor", _fmt(g_agora, 0), "W/m² (última leitura)", "#facc15")
     with t2:
         card("Potência de referência", f"{pmax:.1f}",
              f"W = {pmax_nominal:.0f} W × fator {fator:.2f}", "#67e8f9")
     with t3:
         card("Custo da limpeza", _fmt_rs(custo_limpeza), "água por limpeza", "#a78bfa")
 
-    # ⚖️ Julgamento de cada placa
-    a_limpa = _avaliar_placa(df_ts, PLACA_LIMPA, pmax, custo_limpeza)
-    a_suja = _avaliar_placa(df_ts, PLACA_SUJA, pmax, custo_limpeza)
-
-    # 🕒 Qual trecho do período foi julgado (só leituras com sol)
-    sol = df_ts[df_ts["field7"] >= IRRAD_MIN_JULGAMENTO]
-    if sol.empty:
-        st.markdown(
-            '<div class="decision-box warn">🌙 Sem sol suficiente no período para julgar as placas. '
-            'Escolha um período com leituras durante o dia.</div>', unsafe_allow_html=True)
-    else:
-        ini, fim = sol["timestamp"].min(), sol["timestamp"].max()
-        st.info(
-            f"🕒 Julgamento feito com as **{len(sol)} leituras com sol** do período "
-            f"({ini.strftime('%d/%m %H:%M')} → {fim.strftime('%d/%m %H:%M')}). "
-            "À noite o veredito continua valendo para esse trecho; só os cards \"agora\" zeram."
-        )
-        # Ajuda a escolher o fator: quanto cada placa gerou em relação ao nominal × sensor
-        e_nom = float((pmax_nominal * sol["field7"] / IRRADIANCIA_STC).sum())
-        if e_nom > 0:
-            d_l = sol[PLACA_LIMPA["potencia"]].clip(lower=0).sum() / e_nom
-            d_s = sol[PLACA_SUJA["potencia"]].clip(lower=0).sum() / e_nom
-            st.caption(
-                f"Desempenho observado em relação ao nominal ({pmax_nominal:.0f} W × G_sensor/1000): "
-                f"{PLACA_LIMPA['nome']} {d_l:.0%} · {PLACA_SUJA['nome']} {d_s:.0%}. "
-                f"Fator configurado: {fator:.0%}."
-            )
-
     # Mesma escala Y nos dois gráficos (inclui a curva esperada)
-    esperada = pmax * df_ts["field7"].clip(lower=0) / IRRADIANCIA_STC
-    valores = pd.concat([df_ts[PLACA_LIMPA["potencia"]], df_ts[PLACA_SUJA["potencia"]], esperada]).dropna()
+    series = []
+    for placa in (PLACA_LIMPA, PLACA_SUJA):
+        df = dados[placa["potencia"]][0]
+        if not df.empty:
+            series += [df[placa["potencia"]], pmax * df["field7"].clip(lower=0) / IRRADIANCIA_STC]
+    valores = pd.concat(series).dropna() if series else pd.Series(dtype=float)
     faixa_pot = [0, max(1.0, float(valores.max()) * 1.08)] if not valores.empty else None
 
-    # ⬅️ LIMPA | SUJA ➡️
     col_esq, col_dir = st.columns(2, gap="large")
-    with col_esq:
-        _coluna_julgamento(df_ts, PLACA_LIMPA, a_limpa, pmax, custo_limpeza, faixa_pot)
-    with col_dir:
-        _coluna_julgamento(df_ts, PLACA_SUJA, a_suja, pmax, custo_limpeza, faixa_pot)
+    for col, placa in ((col_esq, PLACA_LIMPA), (col_dir, PLACA_SUJA)):
+        df, a, origem = dados[placa["potencia"]]
+        with col:
+            _coluna_julgamento(df, placa, a, pmax, pmax_nominal, custo_limpeza, faixa_pot, origem, agora)
 
-    st.markdown("---")
-    with st.expander("🧽 Registro de limpeza — zerar contador para um novo teste"):
-        _secao_registro_limpeza(custo_limpeza)
 
 # ============================================================================
 # 🎯 FUNÇÃO PRINCIPAL
@@ -1380,7 +1355,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 2.7 — julgamento por sensor + fator de desempenho</div>',
+        'margin:6px 0">🟢 versão 2.8 — julgamento desde a última limpeza de cada placa</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
