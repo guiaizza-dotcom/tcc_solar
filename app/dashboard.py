@@ -1184,7 +1184,11 @@ def posicao_sol(timestamps):
                                     np.cos(ang_horario) * np.sin(lat) - np.tan(decl) * np.cos(lat))) + 180
     return np.degrees(np.arccos(cos_z)), azimute % 360, doy
 
-def irradiancia_plano_placa(timestamps, ghi):
+COS_Z_MIN       = 0.065    # ≈ sol a 3,7° do horizonte (mesmo limite do pvlib no modelo de Erbs)
+ZENITE_MAX_DIRETA = 87.0   # ° — com o sol mais baixo que isso, toda a luz é tratada como difusa
+DNI_MAX         = 1100.0   # W/m² — teto físico da irradiância direta na superfície
+
+def irradiancia_plano_placa(timestamps, ghi, media_horaria=False):
     """
     Converte a irradiação do sensor HORIZONTAL (GHI) para a irradiação que chega
     no PLANO DA PLACA (inclinação/azimute em PLACA_INCLINACAO_GRAUS/PLACA_AZIMUTE_GRAUS):
@@ -1194,19 +1198,27 @@ def irradiancia_plano_placa(timestamps, ghi):
          (céu isotrópico, Liu-Jordan) + reflexo do chão (albedo);
       4) aplica a perda por reflexão no vidro com sol baixo (IAM, ASHRAE).
     Mesmo resultado do pvlib (validado), sem precisar de dependência extra.
+    media_horaria=True → o dado é a MÉDIA da hora anterior (caso do Open-Meteo):
+    a posição do sol é calculada no meio do intervalo (−30 min).
+    Proteções perto do nascer/pôr do sol (onde dividir por cos θz explode):
+    direta zerada com θz > 87°, cos θz mínimo 0,065 e DNI ≤ 1100 W/m².
     Devolve DataFrame com g_poa (W/m², efetiva), aoi (°) e elev_sol (°).
     """
     ghi = np.clip(pd.to_numeric(pd.Series(ghi), errors="coerce").fillna(0).to_numpy(dtype=float), 0, None)
-    zen, az, doy = posicao_sol(timestamps)
+    ts = pd.to_datetime(pd.Series(timestamps)).reset_index(drop=True)
+    if media_horaria:
+        ts = ts - pd.Timedelta(minutes=30)
+    zen, az, doy = posicao_sol(ts)
     cos_z = np.cos(np.radians(zen))
-    sol_ok = cos_z > 0.0175                       # sol acima de ~1° do horizonte
+    sol_ok = zen < ZENITE_MAX_DIRETA              # sol alto o bastante para ter luz direta
     i0 = 1367 * (1 + 0.033 * np.cos(2 * np.pi * doy / 365))
-    kt = np.clip(np.where(sol_ok, ghi / np.maximum(i0 * cos_z, 1e-6), 0), 0, 1)   # índice de claridade
+    kt = np.clip(np.where(sol_ok, ghi / (i0 * np.maximum(cos_z, COS_Z_MIN)), 0), 0, 1)   # índice de claridade
     fd = np.where(kt <= 0.22, 1 - 0.09 * kt,
          np.where(kt <= 0.80, 0.9511 - 0.1604 * kt + 4.388 * kt**2 - 16.638 * kt**3 + 12.336 * kt**4,
                   0.165))                         # fração difusa (Erbs)
+    fd = np.where(sol_ok, fd, 1.0)                # sem sol direto → tudo difuso
     dhi = ghi * fd
-    dni = np.where(sol_ok, (ghi - dhi) / np.maximum(cos_z, 0.0175), 0)
+    dni = np.clip(np.where(sol_ok, (ghi - dhi) / np.maximum(cos_z, COS_Z_MIN), 0), 0, DNI_MAX)
     beta = np.radians(PLACA_INCLINACAO_GRAUS)
     cos_aoi = (cos_z * np.cos(beta) + np.sin(np.radians(zen)) * np.sin(beta)
                * np.cos(np.radians(az - PLACA_AZIMUTE_GRAUS)))
@@ -1920,7 +1932,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 3.3 — instalação configurável + explicação da zona morta</div>',
+        'margin:6px 0">🟢 versão 3.4 — correção do pico da previsão ao nascer do sol</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
