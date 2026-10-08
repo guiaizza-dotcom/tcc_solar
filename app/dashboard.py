@@ -55,19 +55,12 @@ APP_URL = "https://tcc-ml-vbe-solar.streamlit.app/"  # endereço público do app
 SHEET_ID = "19jK526ZMo0BPvZ6sW3U5O0faVK16rsejEkpyYMBZ7Ec"
 CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSuKaaNCw3461krN9wiYOhL01NISccPj1VMKRx6s3NdeK1G7Lj7G7tYs7C3Tr_oLcOwMCsLhsgTHrOc/pub?output=csv"
 CRED_FILE = "credenciais.json"
-EFICIENCIA = 0.85
 IRRADIANCIA_STC = 1000.0
 TARIFA_KWH = 0.75
 LIMIAR_SUJEIRA = 10.0
 EMAIL_ALERTA_PADRAO = "bittoleoguio@gmail.com"  # usado só se a planilha ainda não tiver e-mail salvo
 
-# --- 💧 Parâmetros de CUSTO DE LIMPEZA (valores padrão; editáveis na barra lateral) ---
-# O custo da limpeza considera apenas a ÁGUA utilizada (litros × preço do m³).
-AGUA_LITROS_PADRAO        = 5.0    # litros de água por limpeza
-AGUA_PRECO_M3_PADRAO      = 5.50   # R$ por m³ (veja na sua conta de água/saneamento)
-
-# --- 📍 Local das placas (usado só na previsão reserva do Open-Meteo) ---
-# ⚠️ CONFIRME: valores padrão = Indaiatuba-SP (UniMAX). Troque pelas coordenadas da bancada.
+# --- 📍 Local das placas (padrão; editável na barra lateral) ---
 LATITUDE  = -23.0903
 LONGITUDE = -47.2181
 
@@ -86,14 +79,12 @@ FUSO_HORARIO_HORAS     = -3.0    # horário de Brasília
 # --- ThingSpeak (Minha Placa ao Vivo) ---
 THINGSPEAK_CHANNEL_ID = "3337625"
 THINGSPEAK_READ_API_KEY = "I7LHJFAFLIN4J5HJ"
-THINGSPEAK_FIELD_IRRADIANCIA = 7  # Field 7 = Irradiação
 
 # --- ThingSpeak (Canal "TCC" — Radiação Solar Estimada via Open-Meteo) ---
 # Canal separado que grava a previsão da API do Open-Meteo, para comparar com o
 # sensor real de irradiância do canal acima (field7).
 THINGSPEAK_CHANNEL_ID_METEO = "3426951"
 THINGSPEAK_READ_API_KEY_METEO = "NHG9H2BKG2NR1M3N"
-THINGSPEAK_FIELD_RADIACAO_ESTIMADA = 1  # Field 1 = Radiação Solar Estimada (Open-Meteo)
 
 # ============================================================================
 # 🎨 ESTILOS CSS
@@ -139,12 +130,6 @@ h2,h3{color:#bae6fd!important}
 .card-value{font-size:28px;font-weight:700;color:#f1f5f9;position:relative;z-index:1}
 .card-unit{font-size:11px;color:#3e6c8f;margin-top:2px;position:relative;z-index:1}
 
-/* 🚦 Caixa de diagnóstico */
-.decision-box{border-radius:10px;padding:22px 28px;font-size:17px;font-weight:600;text-align:center;margin:8px 0 16px 0;border-width:2px;border-style:solid}
-.ok{background:#0b3b24;border-color:#22c55e;color:#bbf7d0}
-.alert{background:#4a1416;border-color:#ef4444;color:#fecaca}
-.warn{background:#4a320b;border-color:#f59e0b;color:#fef3c7}
-
 /* ⚖️ Veredito por placa (aba Comparação) */
 .veredito{border:2px solid;border-radius:12px;padding:16px 14px;text-align:center;margin-bottom:12px}
 .veredito-placa{font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700}
@@ -183,7 +168,7 @@ hr{ border-color:rgba(30,96,145,.5)!important; }
 </style>""", unsafe_allow_html=True)
 
 # ============================================================================
-# 💧 CUSTO DE LIMPEZA — calculado a partir da água utilizada
+# 💧 CUSTO DE LIMPEZA — água + produto + mão de obra + deslocamento + outros
 # ============================================================================
 
 def detalhar_custo_limpeza(agua_litros, agua_preco_m3, produto_rs=0.0, mao_obra_rs=0.0,
@@ -237,6 +222,11 @@ CONFIG_PADRAO = {
     "tarifa_kwh":    0.75,      # R$/kWh
 }
 
+# Valores em uso (aplicar_config troca pelos da barra lateral a cada execução)
+DS_MODELO       = CONFIG_PADRAO["modelo"]
+DS_TOLERANCIA_W = CONFIG_PADRAO["tolerancia_w"]
+DS_GAMMA_PMAX   = CONFIG_PADRAO["gamma_pct"] / 100.0
+
 def direcao_cardinal(azimute):
     """0° → N, 132° → SE, 270° → O…"""
     nomes = ["N", "NE", "L", "SE", "S", "SO", "O", "NO"]
@@ -286,38 +276,28 @@ def aplicar_config(cfg):
 # 📡 FUNÇÕES DE DADOS
 # ============================================================================
 
-def gravar_potencia(potencia):
-    """Grava potência na planilha do Google Sheets"""
+def _segredo(nome, padrao=None):
+    """Lê um valor dos Secrets do Streamlit sem quebrar quando não há secrets.toml."""
     try:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        if "gcp_service_account" in st.secrets:
-            creds = Credentials.from_service_account_info(
-                dict(st.secrets["gcp_service_account"]), scopes=scopes)
-        else:
-            creds = Credentials.from_service_account_file(CRED_FILE, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(SHEET_ID)
-        ws = sh.sheet1
-        ws.update("H2", [[potencia]])
-        return True
-    except Exception as e:
-        st.error(f"Erro ao gravar na planilha: {e}")
-        return False
+        return st.secrets[nome] if nome in st.secrets else padrao
+    except Exception:
+        return padrao
+
+def _abrir_planilha():
+    """Abre a 1ª aba da planilha do Google Sheets com a service account."""
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    conta = _segredo("gcp_service_account")
+    if conta:
+        creds = Credentials.from_service_account_info(dict(conta), scopes=scopes)
+    else:
+        creds = Credentials.from_service_account_file(CRED_FILE, scopes=scopes)
+    return gspread.authorize(creds).open_by_key(SHEET_ID).sheet1
 
 def gravar_emails_alerta(emails):
     """Grava a lista de e-mails de alerta (até 10) na planilha do Google Sheets
     (célula I2, separados por vírgula), para persistir entre sessões."""
     try:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        if "gcp_service_account" in st.secrets:
-            creds = Credentials.from_service_account_info(
-                dict(st.secrets["gcp_service_account"]), scopes=scopes)
-        else:
-            creds = Credentials.from_service_account_file(CRED_FILE, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(SHEET_ID)
-        ws = sh.sheet1
-        ws.update("I2", [[", ".join(emails)]])
+        _abrir_planilha().update("I2", [[", ".join(emails)]])
         return True
     except Exception as e:
         st.error(f"Erro ao gravar e-mails na planilha: {e}")
@@ -329,31 +309,12 @@ def carregar_emails_alerta():
     vírgula). Retorna o e-mail padrão se a planilha nunca foi usada, ou lista
     vazia em caso de erro."""
     try:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        if "gcp_service_account" in st.secrets:
-            creds = Credentials.from_service_account_info(
-                dict(st.secrets["gcp_service_account"]), scopes=scopes)
-        else:
-            creds = Credentials.from_service_account_file(CRED_FILE, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(SHEET_ID)
-        ws = sh.sheet1
-        valor = ws.acell("I2").value
+        valor = _abrir_planilha().acell("I2").value
         if not valor or not valor.strip():
             return [EMAIL_ALERTA_PADRAO]
         return [e.strip() for e in valor.split(",") if e.strip()][:10]
     except Exception:
         return []
-
-def _abrir_planilha():
-    """Abre a 1ª aba da planilha do Google Sheets com a service account."""
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    if "gcp_service_account" in st.secrets:
-        creds = Credentials.from_service_account_info(
-            dict(st.secrets["gcp_service_account"]), scopes=scopes)
-    else:
-        creds = Credentials.from_service_account_file(CRED_FILE, scopes=scopes)
-    return gspread.authorize(creds).open_by_key(SHEET_ID).sheet1
 
 def gravar_ultima_limpeza(data_hora, celula="J2"):
     """Grava a data/hora (horário de Brasília) da última limpeza de UMA placa na
@@ -553,85 +514,6 @@ def buscar_comparacao_irradiancia(data_inicio, data_fim):
     )
     return comp.dropna(subset=["irradiancia_estimada"]).reset_index(drop=True)
 
-def analisar(df, potencia_w, custo_limpeza):
-    """
-    Analisa os dados e decide se compensa limpar.
-
-    NOVA LÓGICA (integrada ao custo real de limpeza):
-      - A perda de energia de cada amostra é calculada usando o INTERVALO REAL de
-        tempo entre uma leitura e a anterior (não mais o antigo "× 48", que assumia
-        12 h de sol constante). Isso torna a perda em R$ defensável na banca.
-      - A DECISÃO é feita no nível do período: soma-se a perda em R$ de todas as
-        amostras, calcula-se a PERDA MÉDIA POR DIA e compara-se diretamente com o
-        CUSTO DA LIMPEZA (água utilizada):
-
-              compensa_limpar  =  (perda_diaria  >=  custo_limpeza)
-
-        Ou seja: quando a placa perde por dia MAIS do que custa limpá-la, recomenda
-        limpar. Se perde menos, o sistema informa em quantos dias a sujeira
-        acumulada vai "pagar" a limpeza (payback).
-
-    Recebe o custo de limpeza já calculado (R$) para não recalcular a cada linha.
-    """
-    df = df.sort_values("timestamp").reset_index(drop=True)
-
-    # Intervalo real (horas) entre cada leitura e a anterior.
-    # A 1ª leitura (e o caso de leitura única) assume 15 min = 0.25 h como padrão.
-    dt_h = df["timestamp"].diff().dt.total_seconds().div(3600)
-    dt_h = dt_h.bfill().fillna(0.25)
-
-    rows = []
-    for i, row in df.iterrows():
-        irrad    = row.get("irradiancia", 0)
-        ger_prev = row.get("geracao_estimada", 0)                       # W (previsto pela API)
-        ger_real = (irrad / IRRADIANCIA_STC) * potencia_w * EFICIENCIA  # W (teórico da placa)
-
-        # Perda percentual instantânea
-        perda_pct = max(0, (ger_prev - ger_real) / ger_prev * 100) if ger_prev > 0 else 0
-        ind = perda_pct > LIMIAR_SUJEIRA
-
-        # Energia perdida NESTA amostra (kWh), usando o intervalo REAL entre leituras:
-        #   potência_perdida(W) × tempo(h) / 1000 = energia(kWh)
-        e_perd_kwh = max(0, ger_prev - ger_real) * dt_h[i] / 1000.0
-        p_fin      = e_perd_kwh * TARIFA_KWH   # R$ perdidos nesta amostra
-
-        rows.append({
-            "geracao_prevista": ger_prev,
-            "geracao_real": round(ger_real, 3),
-            "perda_percentual": round(perda_pct, 2),
-            "indicativo_sujeira": ind,
-            "energia_perdida_kwh": e_perd_kwh,
-            "perda_financeira": round(p_fin, 4),
-            "custo_limpeza": round(custo_limpeza, 4),
-        })
-
-    an = pd.DataFrame(rows)
-
-    # ---- DECISÃO no nível do PERÍODO: perda em R$ acumulada vs custo de limpeza ----
-    dias = max(1, (df["timestamp"].max() - df["timestamp"].min()).days + 1)
-    perda_acumulada = an["perda_financeira"].sum()      # R$ perdidos no período todo
-    perda_diaria    = perda_acumulada / dias            # R$/dia médio
-
-    compensa = bool(perda_diaria >= custo_limpeza) and bool(an["indicativo_sujeira"].any())
-    dias_payback = (custo_limpeza / perda_diaria) if perda_diaria > 0 else float("inf")
-
-    if not an["indicativo_sujeira"].any():
-        msg = "✅ Placa OK. Limpeza não necessária."
-    elif compensa:
-        msg = (f"🚨 Sujeira detectada. Perda ~R${perda_diaria:.2f}/dia ≥ "
-               f"custo de limpeza R${custo_limpeza:.2f}. COMPENSA LIMPAR.")
-    else:
-        payback_txt = f"{dias_payback:.1f} dias" if dias_payback != float("inf") else "—"
-        msg = (f"⚠️ Sujeira leve. Perda ~R${perda_diaria:.2f}/dia < "
-               f"custo R${custo_limpeza:.2f}. Aguardar (a sujeira paga a limpeza em ~{payback_txt}).")
-
-    # Valores de período replicados em todas as linhas (facilita ler an.iloc[-1])
-    an["compensa_limpar"]  = compensa
-    an["mensagem_status"]  = msg
-    an["perda_diaria_est"] = round(perda_diaria, 4)
-    an["dias_payback"]     = round(dias_payback, 2) if dias_payback != float("inf") else None
-    return an
-
 def card(titulo, valor, unidade="", cor="#f1f5f9"):
     """Exibe um card com métrica"""
     st.markdown(
@@ -808,8 +690,7 @@ def render_aba_email():
     st.markdown("---")
     st.subheader("🧪 Diagnóstico e teste manual")
 
-    remetente = st.secrets.get("gmail_remetente", "") if hasattr(st, "secrets") else ""
-    senha_app = st.secrets.get("gmail_senha_app", "") if hasattr(st, "secrets") else ""
+    remetente, senha_app = _segredo("gmail_remetente", ""), _segredo("gmail_senha_app", "")
 
     if remetente and senha_app:
         st.success(f"Credenciais do Gmail encontradas nos Secrets (remetente: {remetente}).")
@@ -855,8 +736,7 @@ def verificar_e_enviar_alerta_email(compensa_limpar: bool, mensagem_alerta: str)
     if not emails_validos:
         return
 
-    remetente = st.secrets.get("gmail_remetente", "") if hasattr(st, "secrets") else ""
-    senha_app = st.secrets.get("gmail_senha_app", "") if hasattr(st, "secrets") else ""
+    remetente, senha_app = _segredo("gmail_remetente", ""), _segredo("gmail_senha_app", "")
     if not remetente or not senha_app:
         return  # credenciais não configuradas em secrets.toml — nada a fazer
 
@@ -932,21 +812,10 @@ def render_placa_ao_vivo():
     # Cards com o valor mais recente de cada field
     st.subheader("Valores Atuais")
     campos = list(THINGSPEAK_CAMPOS.items())
-    linha1, linha2 = campos[:4], campos[4:]
-
-    cols1 = st.columns(4)
-    for col, (campo, info) in zip(cols1, linha1):
-        with col:
-            valor = ultima.get(campo)
-            texto = f"{valor:.1f}" if pd.notna(valor) else "—"
-            card(info["nome"], texto, info["unidade"], info["cor"])
-
-    cols2 = st.columns(4)
-    for col, (campo, info) in zip(cols2, linha2):
-        with col:
-            valor = ultima.get(campo)
-            texto = f"{valor:.1f}" if pd.notna(valor) else "—"
-            card(info["nome"], texto, info["unidade"], info["cor"])
+    for i in range(0, len(campos), 4):
+        for col, (campo, info) in zip(st.columns(4), campos[i:i + 4]):
+            with col:
+                card(info["nome"], _fmt(ultima.get(campo)), info["unidade"], info["cor"])
 
     st.markdown("---")
 
@@ -1140,10 +1009,7 @@ def render_placa_ao_vivo():
 #
 # Por padrão o julgamento de cada placa começa na SUA última limpeza registrada.
 
-# --- 📄 Datasheet RESUN RSM020P ---
-DS_MODELO       = "RESUN RSM020P"
-DS_TOLERANCIA_W = 5.0       # tolerância positiva de potência: 0 ~ +5 W
-DS_GAMMA_PMAX   = -0.0039   # coeficiente de temperatura de Pmax: −0,39 %/°C
+# Datasheet (modelo, tolerância e coef. de temperatura): ver CONFIG_PADRAO / barra lateral.
 DS_T_STC        = 25.0      # °C — temperatura de célula na condição STC
 
 # Fields de cada placa no canal ThingSpeak (os nomes são só rótulos das bancadas)
@@ -1247,13 +1113,24 @@ def irradiancia_plano_placa(timestamps, ghi, media_horaria=False):
     solo = ghi * ALBEDO_SOLO * (1 - np.cos(beta)) / 2
     return pd.DataFrame({"g_poa": direta + difusa + solo, "aoi": aoi, "elev_sol": 90 - zen})
 
+GEO_COLS = ["g_poa", "aoi", "elev_sol"]
+
 def _geometria(df):
-    """g_poa / aoi / elev_sol alinhados ao índice do df (a partir de timestamp + field7)."""
+    """g_poa / aoi / elev_sol alinhados ao índice do df (a partir de timestamp + field7).
+    Se o df já tem essas colunas (com_geometria), só devolve — não recalcula."""
+    if all(c in df for c in GEO_COLS):
+        return df[GEO_COLS]
     if df.empty:
         return pd.DataFrame(columns=["g_poa", "aoi", "elev_sol"], index=df.index, dtype=float)
     geo = irradiancia_plano_placa(df["timestamp"], df["field7"])
     geo.index = df.index
     return geo
+
+def com_geometria(df):
+    """Acrescenta g_poa / aoi / elev_sol ao df uma única vez (evita refazer a conta do sol)."""
+    if df.empty or "field7" not in df or all(c in df for c in GEO_COLS):
+        return df
+    return df.join(_geometria(df))
 
 def faixa_datasheet(df, placa, pmax):
     """Série (P_mín, P_máx) em W para cada leitura, pela irradiação do sensor
@@ -1270,12 +1147,17 @@ def perda_vs_datasheet(df, placa, pmax, g_min=0.0, aoi_max=90.0):
     Perda = energia LÍQUIDA que faltou para atingir o mínimo garantido (20 W).
     """
     cols = ["timestamp", placa["potencia"], "field7"] + \
-           ([placa["temperatura"]] if placa["temperatura"] in df else [])
-    d = df[cols].dropna(subset=["timestamp", placa["potencia"], "field7"]).sort_values("timestamp").copy()
+           ([placa["temperatura"]] if placa["temperatura"] in df else []) + \
+           [c for c in GEO_COLS if c in df]
+    d = com_geometria(df[cols].dropna(subset=["timestamp", placa["potencia"], "field7"])
+                      .sort_values("timestamp").copy())
     if len(d) < 2:
         return None
-    d["dt_h"] = d["timestamp"].diff().dt.total_seconds().div(3600).fillna(0).clip(upper=0.5)
-    d = d.join(_geometria(d))
+    # Intervalo real até a leitura anterior. Buracos (noite, sensor fora do ar)
+    # contam como um intervalo típico, não como horas paradas.
+    dt = d["timestamp"].diff().dt.total_seconds().div(3600)
+    tipico = dt[dt > 0].median() if (dt > 0).any() else 0.25
+    d["dt_h"] = dt.where(dt <= 0.5, tipico).fillna(0)
     d = d[(d["g_poa"] >= g_min) & (d["aoi"] <= aoi_max)]
     if d.empty:
         return None
@@ -1385,7 +1267,6 @@ def _bloco_requisitos(a, custo_limpeza):
     )
 
     # 💸 Quanto deixou de ser gerado por estar abaixo do mínimo do datasheet
-    perda_kwh = a["perda_wh"] / 1000.0
     linhas_perda = (
         f'<div class="req-linha"><span>💸 Deixou de gerar desde a limpeza</span>'
         f'<span class="req-valor">{_fmt(a["perda_wh"], 1)} Wh = <b>{_fmt_rs(a["perda_rs"])}</b></span></div>'
@@ -1440,18 +1321,36 @@ def _controles_limpeza(placa, agora):
                     st.cache_data.clear()
                     st.rerun()
 
+def _bloco_aguardando(placa, origem):
+    """Cartão de quando ainda não há leituras para julgar a placa."""
+    st.markdown(
+        f'<div class="veredito" style="background:#1e293b;border-color:#64748b">'
+        f'<div class="veredito-placa" style="color:{placa["cor"]}">{placa["emoji"]} {placa["nome"]}</div>'
+        f'<div class="veredito-label" style="color:#cbd5e1">⏳ AGUARDANDO</div>'
+        f'<div class="veredito-sub">ainda não há leituras desde {origem}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+def _df_desde_limpeza(placa, hoje):
+    """Leituras de UMA placa desde a última limpeza registrada dela (ou desde hoje 00:00)."""
+    limpeza = carregar_ultima_limpeza(placa["celula"])
+    inicio = limpeza or datetime.combine(hoje, datetime.min.time())
+    origem = (f"a limpeza de {inicio.strftime('%d/%m %H:%M')}" if limpeza
+              else "hoje 00:00 (nenhuma limpeza registrada)")
+    df = buscar_historico_thingspeak(inicio.date(), hoje)
+    if not df.empty:
+        df = df[df["timestamp"] >= inicio].reset_index(drop=True)
+    return df, origem
+
+def _df_valido(df):
+    return not df.empty and len(df) >= 2 and "field7" in df
+
 def _coluna_julgamento(df, placa, a, pmax, custo_limpeza, faixa_pot, origem, agora):
     """Uma coluna completa (veredito + limpeza + números + requisitos + 1 gráfico) para UMA placa."""
     cor = placa["cor"]
 
     if a is None:
-        st.markdown(
-            f'<div class="veredito" style="background:#1e293b;border-color:#64748b">'
-            f'<div class="veredito-placa" style="color:{cor}">{placa["emoji"]} {placa["nome"]}</div>'
-            f'<div class="veredito-label" style="color:#cbd5e1">⏳ AGUARDANDO</div>'
-            f'<div class="veredito-sub">ainda não há leituras desde {origem}</div></div>',
-            unsafe_allow_html=True,
-        )
+        _bloco_aguardando(placa, origem)
         _controles_limpeza(placa, agora)
         return
 
@@ -1564,20 +1463,15 @@ def render_comparacao(custo_limpeza, pmax):
     with st.spinner("Buscando dados do ThingSpeak..."):
         for placa in (PLACA_LIMPA, PLACA_SUJA):
             if desde_limpeza:
-                limpeza = carregar_ultima_limpeza(placa["celula"])
-                inicio = limpeza or datetime.combine(hoje, datetime.min.time())
-                origem = (f"a limpeza de {inicio.strftime('%d/%m %H:%M')}" if limpeza
-                          else "hoje 00:00 (nenhuma limpeza registrada)")
-                df = buscar_historico_thingspeak(inicio.date(), hoje)
-                if not df.empty:
-                    df = df[df["timestamp"] >= inicio].reset_index(drop=True)
+                df, origem = _df_desde_limpeza(placa, hoje)
             else:
                 origem = f"{data_inicio.strftime('%d/%m')} a {data_fim.strftime('%d/%m')}"
                 df = buscar_historico_thingspeak(data_inicio, data_fim)
-            if df.empty or len(df) < 2 or "field7" not in df:
-                dados[placa["potencia"]] = (pd.DataFrame(), None, origem)
-            else:
+            if _df_valido(df):
+                df = com_geometria(df)
                 dados[placa["potencia"]] = (df, _avaliar_placa(df, placa, pmax, custo_limpeza), origem)
+            else:
+                dados[placa["potencia"]] = (pd.DataFrame(), None, origem)
 
     # 🌤️ Condições do teste (comuns às duas placas) — leitura mais recente disponível
     df_agora = buscar_historico_thingspeak(hoje, hoje) if desde_limpeza else \
@@ -1779,17 +1673,11 @@ def _previsao_futura(df_sheets, agora, dias):
     return fut.sort_values("timestamp").reset_index(drop=True) if not fut.empty else fut, fonte_irr, fonte_chuva
 
 def _dados_placa_desde_limpeza(placa, pmax, custo_limpeza, hoje):
-    """Leituras e julgamento de UMA placa desde a última limpeza registrada dela."""
-    limpeza = carregar_ultima_limpeza(placa["celula"])
-    inicio = limpeza or datetime.combine(hoje, datetime.min.time())
-    origem = (f"a limpeza de {inicio.strftime('%d/%m %H:%M')}" if limpeza
-              else "hoje 00:00 (nenhuma limpeza registrada)")
-    df = buscar_historico_thingspeak(inicio.date(), hoje)
-    if not df.empty:
-        df = df[df["timestamp"] >= inicio].reset_index(drop=True)
-    if df.empty or len(df) < 2 or "field7" not in df:
+    """Julgamento de UMA placa desde a última limpeza registrada dela."""
+    df, origem = _df_desde_limpeza(placa, hoje)
+    if not _df_valido(df):
         return None, origem
-    return _avaliar_placa(df, placa, pmax, custo_limpeza), origem
+    return _avaliar_placa(com_geometria(df), placa, pmax, custo_limpeza), origem
 
 def _linha_agora(fig, agora):
     """Linha vertical 'agora' (feita com shape + annotation; add_vline com data dá erro em algumas versões do Plotly)."""
@@ -1813,17 +1701,11 @@ def render_previsao(df_sheets, custo_limpeza, pmax):
         a, origem = _dados_placa_desde_limpeza(placa, pmax, custo_limpeza, hoje)
         with col:
             if a is None:
-                st.markdown(
-                    f'<div class="veredito" style="background:#1e293b;border-color:#64748b">'
-                    f'<div class="veredito-placa" style="color:{placa["cor"]}">{placa["emoji"]} {placa["nome"]}</div>'
-                    f'<div class="veredito-label" style="color:#cbd5e1">⏳ AGUARDANDO</div>'
-                    f'<div class="veredito-sub">ainda não há leituras desde {origem}</div></div>',
-                    unsafe_allow_html=True,
-                )
+                _bloco_aguardando(placa, origem)
                 continue
             _bloco_veredito(placa, a)
             _bloco_requisitos(a, custo_limpeza)
-            st.caption(f"📍 Desde {origem} — {a['n_sol']} leituras com sol.")
+            st.caption(f"📍 Desde {origem} — {a['n_sol']} leituras na janela de julgamento.")
             if a["compensa"]:
                 alertas.append(f"{placa['nome']}: {a['perda_pct']:.1f}% abaixo do mínimo do datasheet, "
                                f"perda {_fmt_rs(a['perda_dia'])}/dia ≥ custo {_fmt_rs(custo_limpeza)}; "
@@ -1968,7 +1850,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 3.5 — custo de limpeza detalhado + dinheiro perdido pela sujeira</div>',
+        'margin:6px 0">🟢 versão 3.6 — revisão geral (correções + código enxuto)</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
@@ -1982,14 +1864,16 @@ def main():
         st.markdown("---")
 
         cfg_salva = carregar_config()
+        for k, v in cfg_salva.items():          # valor inicial dos campos = configuração salva
+            st.session_state.setdefault(f"cfg_{k}", v)
 
         def _num(rotulo, chave, **kw):
-            return st.number_input(rotulo, value=float(cfg_salva[chave]), key=f"cfg_{chave}", **kw)
+            return st.number_input(rotulo, key=f"cfg_{chave}", **kw)
 
         # ---------------------------------------------------------------- ⚡ Placa
         st.subheader("⚡ Minha Placa (datasheet)")
         with st.expander("Dados do datasheet", expanded=False):
-            modelo = st.text_input("Modelo da placa", value=cfg_salva["modelo"], key="cfg_modelo")
+            modelo = st.text_input("Modelo da placa", key="cfg_modelo")
             potencia_cliente = _num("Potência nominal Pmax (W)", "potencia_w",
                                     min_value=1.0, max_value=50000.0, step=5.0)
             tolerancia = _num("Tolerância positiva (+W)", "tolerancia_w",
@@ -2060,7 +1944,7 @@ def main():
             st.warning("⚠️ Alterações em uso só nesta sessão — salve para valer sempre (inclusive nos alertas).")
         if st.button("💾 Salvar configuração", use_container_width=True, disabled=not alterado):
             if gravar_config(cfg_atual):
-                st.success("✅ Configuração salva na planilha!")
+                st.toast("✅ Configuração salva na planilha!")
                 st.cache_data.clear()
                 st.rerun()
 
@@ -2077,7 +1961,7 @@ def main():
             st.cache_data.clear()
             st.rerun()
 
-        st.caption(f"Atualizado: {datetime.now().strftime('%H:%M:%S')}")
+        st.caption(f"Atualizado: {agora_brasil().strftime('%H:%M:%S')}")
 
     # 🧪 BOTÃO DE TESTE DE NOTIFICAÇÃO
     mostrar_botao_teste_notificacao()
