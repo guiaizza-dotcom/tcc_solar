@@ -3,10 +3,12 @@
 # ============================================================================
 
 import re
+import json
 import smtplib
 from email.mime.text import MIMEText
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime
 import gspread
@@ -67,6 +69,18 @@ AGUA_PRECO_M3_PADRAO      = 5.50   # R$ por m³ (veja na sua conta de água/sane
 # ⚠️ CONFIRME: valores padrão = Indaiatuba-SP (UniMAX). Troque pelas coordenadas da bancada.
 LATITUDE  = -23.0903
 LONGITUDE = -47.2181
+
+# --- 📐 Geometria das placas x sensor de irradiação ---
+# O sensor de irradiação fica NIVELADO (horizontal) → mede a irradiância global
+# horizontal (GHI). As placas ficam INCLINADAS e viradas para outro lado, então
+# recebem outra irradiância (no plano da placa, POA). Sem converter, a faixa do
+# datasheet fica errada conforme a posição do sol — principalmente à tarde,
+# quando o sol vai para o oeste e as placas estão viradas para o sudeste.
+PLACA_INCLINACAO_GRAUS = 23.0    # inclinação das placas em relação ao chão
+PLACA_AZIMUTE_GRAUS    = 132.0   # para onde a placa "olha" (0 = Norte, 90 = Leste, 180 = Sul) → 132° = SE
+ALBEDO_SOLO            = 0.20    # refletância do chão (0,2 = grama/terra; concreto claro ≈ 0,3)
+IAM_B0                 = 0.05    # perda por reflexão no vidro com sol baixo (modelo ASHRAE)
+FUSO_HORARIO_HORAS     = -3.0    # horário de Brasília
 
 # --- ThingSpeak (Minha Placa ao Vivo) ---
 THINGSPEAK_CHANNEL_ID = "3337625"
@@ -171,12 +185,83 @@ hr{ border-color:rgba(30,96,145,.5)!important; }
 # 💧 CUSTO DE LIMPEZA — calculado a partir da água utilizada
 # ============================================================================
 
-def custo_total_limpeza(agua_litros, agua_preco_m3):
+def custo_total_limpeza(agua_litros, agua_preco_m3, outros_custos=0.0):
     """
-    Custo de UMA limpeza (R$), considerando apenas a água:
-      (litros / 1000) m³ × preço do m³
+    Custo de UMA limpeza (R$):
+      água  = (litros / 1000) m³ × preço do m³
+      total = água + outros custos (detergente, mão de obra, deslocamento…)
     """
-    return (agua_litros / 1000.0) * agua_preco_m3
+    return (agua_litros / 1000.0) * agua_preco_m3 + outros_custos
+
+# ============================================================================
+# ⚙️ CONFIGURAÇÃO DA INSTALAÇÃO — editável na barra lateral e salva na planilha
+# ============================================================================
+# Tudo que muda de uma placa/instalação para outra fica aqui. Os valores abaixo
+# são só o PADRÃO (bancada do TCC). Na barra lateral dá para trocar e salvar;
+# a configuração salva vai em JSON na célula L2 da planilha e é recarregada
+# sempre que o app abre. Todas as contas (faixa do datasheet, conversão para o
+# plano da placa, perda em R$, previsão) usam os valores que estão em uso.
+
+CONFIG_CELULA = "L2"
+CONFIG_PADRAO = {
+    "modelo":        "RESUN RSM020P",
+    "potencia_w":    20.0,      # Pmax nominal (STC)
+    "tolerancia_w":  5.0,       # tolerância positiva do datasheet (0 ~ +X W)
+    "gamma_pct":     -0.39,     # coef. de temperatura de Pmax (%/°C)
+    "inclinacao":    23.0,      # ° em relação ao chão
+    "azimute":       132.0,     # ° — 0 = Norte, 90 = Leste, 180 = Sul, 270 = Oeste
+    "latitude":      -23.0903,
+    "longitude":     -47.2181,
+    "agua_litros":   5.0,
+    "agua_preco_m3": 5.50,
+    "outros_custos": 0.0,       # R$ por limpeza além da água
+    "tarifa_kwh":    0.75,      # R$/kWh
+}
+
+def direcao_cardinal(azimute):
+    """0° → N, 132° → SE, 270° → O…"""
+    nomes = ["N", "NE", "L", "SE", "S", "SO", "O", "NO"]
+    return nomes[int(((azimute % 360) + 22.5) // 45) % 8]
+
+@st.cache_data(ttl=30)
+def carregar_config():
+    """Lê a configuração salva na planilha (JSON na célula L2). Campos que faltarem
+    ficam com o padrão. Em caso de erro devolve o padrão."""
+    cfg = dict(CONFIG_PADRAO)
+    try:
+        valor = _abrir_planilha().acell(CONFIG_CELULA).value
+        if valor and str(valor).strip():
+            salvo = json.loads(str(valor))
+            for k, v in salvo.items():
+                if k in cfg:
+                    cfg[k] = type(CONFIG_PADRAO[k])(v)
+    except Exception:
+        pass
+    return cfg
+
+def gravar_config(cfg):
+    """Salva a configuração (JSON em L2) e a potência também em H2 (compatibilidade)."""
+    try:
+        ws = _abrir_planilha()
+        ws.update(CONFIG_CELULA, [[json.dumps(cfg, ensure_ascii=False)]])
+        ws.update("H2", [[cfg["potencia_w"]]])
+        return True
+    except Exception as e:
+        st.error(f"Erro ao salvar a configuração na planilha: {e}")
+        return False
+
+def aplicar_config(cfg):
+    """Coloca a configuração em uso: todas as funções de cálculo leem estes globais."""
+    global DS_MODELO, DS_TOLERANCIA_W, DS_GAMMA_PMAX, TARIFA_KWH
+    global PLACA_INCLINACAO_GRAUS, PLACA_AZIMUTE_GRAUS, LATITUDE, LONGITUDE
+    DS_MODELO              = cfg["modelo"]
+    DS_TOLERANCIA_W        = float(cfg["tolerancia_w"])
+    DS_GAMMA_PMAX          = float(cfg["gamma_pct"]) / 100.0
+    TARIFA_KWH             = float(cfg["tarifa_kwh"])
+    PLACA_INCLINACAO_GRAUS = float(cfg["inclinacao"])
+    PLACA_AZIMUTE_GRAUS    = float(cfg["azimute"])
+    LATITUDE               = float(cfg["latitude"])
+    LONGITUDE              = float(cfg["longitude"])
 
 # ============================================================================
 # 📡 FUNÇÕES DE DADOS
@@ -1050,7 +1135,11 @@ PLACA_SUJA  = {"nome": "Placa Suja",  "emoji": "🟠", "cor": "#f59e0b",
 
 # Abaixo dessa irradiação (noite/amanhecer/entardecer) a comparação vira ruído,
 # então essas leituras não entram no julgamento.
-IRRAD_MIN_JULGAMENTO = 50.0    # W/m²
+IRRAD_MIN_JULGAMENTO = 50.0    # W/m² (irradiação no plano da placa)
+# Janela de julgamento: com o sol muito de lado em relação à placa (ângulo de
+# incidência alto) a conversão horizontal → plano da placa e a reflexão no vidro
+# ficam imprecisas. Essas leituras aparecem no gráfico, mas NÃO entram no julgamento.
+AOI_MAX_JULGAMENTO   = 70.0    # ° — ângulo máximo entre o sol e a perpendicular da placa
 # Energia esperada mínima no período para o julgamento ser confiável
 ENERGIA_MIN_JULGAMENTO = 1.0   # Wh
 
@@ -1070,15 +1159,82 @@ def fator_temperatura(t_placa):
     f = 1 + DS_GAMMA_PMAX * (t - DS_T_STC)
     return f.fillna(1.0) if hasattr(f, "fillna") else (1.0 if pd.isna(f) else f)
 
+def posicao_sol(timestamps):
+    """
+    Posição do sol (zênite e azimute, em graus) para cada horário LOCAL.
+    Equações da NOAA (Spencer) — erro < 1° para esta aplicação.
+    Azimute: 0 = Norte, 90 = Leste, 180 = Sul, 270 = Oeste.
+    """
+    ts = pd.to_datetime(pd.Series(timestamps)).reset_index(drop=True)
+    doy = ts.dt.dayofyear.to_numpy(dtype=float)
+    hora = (ts.dt.hour + ts.dt.minute / 60 + ts.dt.second / 3600).to_numpy(dtype=float)
+    gama = 2 * np.pi / 365 * (doy - 1 + (hora - 12) / 24)
+    eq_tempo = 229.18 * (0.000075 + 0.001868 * np.cos(gama) - 0.032077 * np.sin(gama)
+                         - 0.014615 * np.cos(2 * gama) - 0.040849 * np.sin(2 * gama))   # min
+    decl = (0.006918 - 0.399912 * np.cos(gama) + 0.070257 * np.sin(gama)
+            - 0.006758 * np.cos(2 * gama) + 0.000907 * np.sin(2 * gama)
+            - 0.002697 * np.cos(3 * gama) + 0.00148 * np.sin(3 * gama))                 # rad
+    hora_solar = hora + (eq_tempo + 4 * LONGITUDE - 60 * FUSO_HORARIO_HORAS) / 60
+    ang_horario = np.radians(15 * (hora_solar - 12))
+    lat = np.radians(LATITUDE)
+    cos_z = np.clip(np.sin(lat) * np.sin(decl)
+                    + np.cos(lat) * np.cos(decl) * np.cos(ang_horario), -1, 1)
+    azimute = np.degrees(np.arctan2(np.sin(ang_horario),
+                                    np.cos(ang_horario) * np.sin(lat) - np.tan(decl) * np.cos(lat))) + 180
+    return np.degrees(np.arccos(cos_z)), azimute % 360, doy
+
+def irradiancia_plano_placa(timestamps, ghi):
+    """
+    Converte a irradiação do sensor HORIZONTAL (GHI) para a irradiação que chega
+    no PLANO DA PLACA (inclinação/azimute em PLACA_INCLINACAO_GRAUS/PLACA_AZIMUTE_GRAUS):
+      1) posição do sol no horário da leitura;
+      2) separa GHI em direta (DNI) e difusa (DHI) — modelo de Erbs;
+      3) soma no plano da placa: direta × cos(ângulo de incidência) + difusa
+         (céu isotrópico, Liu-Jordan) + reflexo do chão (albedo);
+      4) aplica a perda por reflexão no vidro com sol baixo (IAM, ASHRAE).
+    Mesmo resultado do pvlib (validado), sem precisar de dependência extra.
+    Devolve DataFrame com g_poa (W/m², efetiva), aoi (°) e elev_sol (°).
+    """
+    ghi = np.clip(pd.to_numeric(pd.Series(ghi), errors="coerce").fillna(0).to_numpy(dtype=float), 0, None)
+    zen, az, doy = posicao_sol(timestamps)
+    cos_z = np.cos(np.radians(zen))
+    sol_ok = cos_z > 0.0175                       # sol acima de ~1° do horizonte
+    i0 = 1367 * (1 + 0.033 * np.cos(2 * np.pi * doy / 365))
+    kt = np.clip(np.where(sol_ok, ghi / np.maximum(i0 * cos_z, 1e-6), 0), 0, 1)   # índice de claridade
+    fd = np.where(kt <= 0.22, 1 - 0.09 * kt,
+         np.where(kt <= 0.80, 0.9511 - 0.1604 * kt + 4.388 * kt**2 - 16.638 * kt**3 + 12.336 * kt**4,
+                  0.165))                         # fração difusa (Erbs)
+    dhi = ghi * fd
+    dni = np.where(sol_ok, (ghi - dhi) / np.maximum(cos_z, 0.0175), 0)
+    beta = np.radians(PLACA_INCLINACAO_GRAUS)
+    cos_aoi = (cos_z * np.cos(beta) + np.sin(np.radians(zen)) * np.sin(beta)
+               * np.cos(np.radians(az - PLACA_AZIMUTE_GRAUS)))
+    aoi = np.degrees(np.arccos(np.clip(cos_aoi, -1, 1)))
+    iam = np.where(aoi < 90, np.clip(1 - IAM_B0 * (1 / np.maximum(cos_aoi, 1e-6) - 1), 0, 1), 0)
+    direta = dni * np.clip(cos_aoi, 0, None) * iam
+    difusa = dhi * (1 + np.cos(beta)) / 2
+    solo = ghi * ALBEDO_SOLO * (1 - np.cos(beta)) / 2
+    return pd.DataFrame({"g_poa": direta + difusa + solo, "aoi": aoi, "elev_sol": 90 - zen})
+
+def _geometria(df):
+    """g_poa / aoi / elev_sol alinhados ao índice do df (a partir de timestamp + field7)."""
+    if df.empty:
+        return pd.DataFrame(columns=["g_poa", "aoi", "elev_sol"], index=df.index, dtype=float)
+    geo = irradiancia_plano_placa(df["timestamp"], df["field7"])
+    geo.index = df.index
+    return geo
+
 def faixa_datasheet(df, placa, pmax):
-    """Série (P_mín, P_máx) em W para cada leitura, pela irradiação do sensor."""
-    g = df["field7"].clip(lower=0) / IRRADIANCIA_STC
+    """Série (P_mín, P_máx) em W para cada leitura, pela irradiação do sensor
+    convertida para o PLANO DA PLACA (inclinação + orientação)."""
+    g = _geometria(df)["g_poa"].clip(lower=0) / IRRADIANCIA_STC
     ft = fator_temperatura(df[placa["temperatura"]]) if placa["temperatura"] in df else 1.0
     return pmax * g * ft, (pmax + DS_TOLERANCIA_W) * g * ft
 
-def perda_vs_datasheet(df, placa, pmax, g_min=0.0):
+def perda_vs_datasheet(df, placa, pmax, g_min=0.0, aoi_max=90.0):
     """
-    Energia gerada x faixa do datasheet no período (só leituras com G ≥ g_min).
+    Energia gerada x faixa do datasheet no período — só leituras dentro da JANELA
+    DE JULGAMENTO: irradiação no plano da placa ≥ g_min e ângulo de incidência ≤ aoi_max.
     Cada leitura é multiplicada pelo intervalo real até a anterior (≤ 30 min) → Wh.
     Perda = energia LÍQUIDA que faltou para atingir o mínimo garantido (20 W).
     """
@@ -1088,7 +1244,8 @@ def perda_vs_datasheet(df, placa, pmax, g_min=0.0):
     if len(d) < 2:
         return None
     d["dt_h"] = d["timestamp"].diff().dt.total_seconds().div(3600).fillna(0).clip(upper=0.5)
-    d = d[d["field7"] >= g_min]
+    d = d.join(_geometria(d))
+    d = d[(d["g_poa"] >= g_min) & (d["aoi"] <= aoi_max)]
     if d.empty:
         return None
     d["p_min"], d["p_max"] = faixa_datasheet(d, placa, pmax)
@@ -1117,7 +1274,7 @@ def _avaliar_placa(df, placa, pmax, custo_limpeza):
     """
     ultima = df.iloc[-1:]
     p_min_agora, p_max_agora = faixa_datasheet(ultima, placa, pmax)
-    pv = perda_vs_datasheet(df, placa, pmax, g_min=IRRAD_MIN_JULGAMENTO)
+    pv = perda_vs_datasheet(df, placa, pmax, g_min=IRRAD_MIN_JULGAMENTO, aoi_max=AOI_MAX_JULGAMENTO)
 
     a = {
         "pot_atual": ultima[placa["potencia"]].iloc[0],
@@ -1252,7 +1409,7 @@ def _coluna_julgamento(df, placa, a, pmax, custo_limpeza, faixa_pot, origem, ago
 
     _bloco_veredito(placa, a)
     t_txt = f" — placa a {a['t_placa']:.0f} °C agora" if a["t_placa"] is not None and pd.notna(a["t_placa"]) else ""
-    st.caption(f"📍 Julgando desde **{origem}** — {a['n_sol']} leituras com sol{t_txt}.")
+    st.caption(f"📍 Julgando desde **{origem}** — {a['n_sol']} leituras na janela de julgamento{t_txt}.")
     _controles_limpeza(placa, agora)
 
     c1, c2 = st.columns(2)
@@ -1260,7 +1417,7 @@ def _coluna_julgamento(df, placa, a, pmax, custo_limpeza, faixa_pot, origem, ago
         card("Potência medida", _fmt(a["pot_atual"]), "W (agora)", cor)
     with c2:
         card("Potência esperada", f"{_fmt(a['p_min'])} – {_fmt(a['p_max'])}",
-             "W (20–25 W × G/1000 × temp.)", "#facc15")
+             f"W ({pmax:.0f}–{pmax + DS_TOLERANCIA_W:.0f} W × G_placa/1000 × temp.)", "#facc15")
     c3, c4 = st.columns(2)
     with c3:
         card("Energia gerada", _fmt(a["e_real"], 2), "Wh com sol", cor)
@@ -1272,17 +1429,23 @@ def _coluna_julgamento(df, placa, a, pmax, custo_limpeza, faixa_pot, origem, ago
     p_min, p_max = faixa_datasheet(df, placa, pmax)
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=df["timestamp"], y=p_max, name="Máx. datasheet (25 W)",
+        x=df["timestamp"], y=p_max, name=f"Máx. datasheet ({pmax + DS_TOLERANCIA_W:.0f} W)",
         line=dict(color="rgba(250,204,21,0.6)", width=1, dash="dot"),
     ))
     fig.add_trace(go.Scatter(
-        x=df["timestamp"], y=p_min, name="Mín. garantido (20 W)",
+        x=df["timestamp"], y=p_min, name=f"Mín. garantido ({pmax:.0f} W)",
         fill="tonexty", fillcolor="rgba(250,204,21,0.12)",
         line=dict(color="#facc15", width=2, dash="dash"),
     ))
     fig.add_trace(go.Scatter(
         x=df["timestamp"], y=df[placa["potencia"]], name="Medida",
         line=dict(color=cor, width=2.5),
+    ))
+    geo = _geometria(df)
+    fora = (geo["aoi"] > AOI_MAX_JULGAMENTO) | (geo["g_poa"] < IRRAD_MIN_JULGAMENTO)
+    fig.add_trace(go.Scatter(
+        x=df["timestamp"], y=df[placa["potencia"]].where(fora), name="Fora da janela (não julga)",
+        mode="markers", marker=dict(color="#94a3b8", size=5),
     ))
     fig.update_layout(**LAY, title="Potência medida x faixa do datasheet (W)", yaxis_title="W", height=320)
     if faixa_pot:
@@ -1301,9 +1464,13 @@ def render_comparacao(custo_limpeza, pmax):
     st.subheader("⚖️ Comparação — julgamento de cada placa")
     st.caption(
         f"Referência: datasheet **{DS_MODELO}** — {pmax:.0f} W com tolerância **0 a +{DS_TOLERANCIA_W:.0f} W**, "
-        f"corrigida pela temperatura da placa ({DS_GAMMA_PMAX*100:.2f} %/°C) e pela irradiação do sensor. "
+        f"corrigida pela temperatura da placa ({DS_GAMMA_PMAX*100:.2f} %/°C) e pela irradiação do sensor "
+        f"**convertida do plano horizontal para o plano da placa** ({PLACA_INCLINACAO_GRAUS:.0f}° de inclinação, "
+        f"virada a {PLACA_AZIMUTE_GRAUS:.0f}°). "
         f"Gerou pelo menos o mínimo garantido → **LIMPA**; ficou mais de {LIMIAR_SUJEIRA:.0f}% abaixo → **SUJA**. "
-        f"Só entram leituras com irradiação ≥ {IRRAD_MIN_JULGAMENTO:.0f} W/m²."
+        f"Só entram no julgamento leituras com irradiação na placa ≥ {IRRAD_MIN_JULGAMENTO:.0f} W/m² e sol a "
+        f"no máximo {AOI_MAX_JULGAMENTO:.0f}° da perpendicular da placa — fora disso (sol muito de lado, fim de tarde) "
+        f"a leitura aparece no gráfico em cinza, mas não conta."
     )
 
     m1, m2 = st.columns([3, 1])
@@ -1375,7 +1542,7 @@ def render_comparacao(custo_limpeza, pmax):
         card("Datasheet", f"{pmax:.0f} – {pmax + DS_TOLERANCIA_W:.0f}",
              f"W a 1000 W/m² · {DS_MODELO}", "#67e8f9")
     with t3:
-        card("Custo da limpeza", _fmt_rs(custo_limpeza), "água por limpeza", "#a78bfa")
+        card("Custo da limpeza", _fmt_rs(custo_limpeza), "por limpeza", "#a78bfa")
 
     # Mesma escala Y nos dois gráficos (inclui a faixa do datasheet)
     series = []
@@ -1404,7 +1571,7 @@ def render_comparacao(custo_limpeza, pmax):
 #   ThingSpeak; para frente a previsão.
 
 @st.cache_data(ttl=1800)
-def buscar_previsao_openmeteo(dias=3):
+def buscar_previsao_openmeteo(dias=3, lat=None, lon=None):
     """
     Previsão horária direto da API Open-Meteo (gratuita, sem chave) — usada só
     como RESERVA, quando a planilha não tiver linhas futuras ou coluna de chuva.
@@ -1413,7 +1580,8 @@ def buscar_previsao_openmeteo(dias=3):
         resp = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
-                "latitude": LATITUDE, "longitude": LONGITUDE,
+                "latitude": LATITUDE if lat is None else lat,
+                "longitude": LONGITUDE if lon is None else lon,
                 "hourly": "shortwave_radiation,precipitation_probability,precipitation",
                 "forecast_days": int(dias) + 1, "timezone": "America/Sao_Paulo",
             },
@@ -1444,13 +1612,13 @@ def _previsao_futura(df_sheets, agora, dias):
     om = None
     fonte_irr = "planilha (API)"
     if fut.empty or "irradiancia" not in fut:
-        om = buscar_previsao_openmeteo(dias)
+        om = buscar_previsao_openmeteo(dias, LATITUDE, LONGITUDE)
         fut = om[(om["timestamp"] > agora) & (om["timestamp"] <= fim)].copy() if not om.empty else om
         fonte_irr = "Open-Meteo (reserva)"
 
     fonte_chuva = "planilha (API)"
     if fut.empty or "chuva" not in fut or fut["chuva"].isna().all():
-        om = buscar_previsao_openmeteo(dias) if om is None else om
+        om = buscar_previsao_openmeteo(dias, LATITUDE, LONGITUDE) if om is None else om
         if not om.empty and not fut.empty:
             fut = pd.merge_asof(
                 fut.sort_values("timestamp").drop(columns=["chuva", "chuva_mm"], errors="ignore"),
@@ -1488,7 +1656,7 @@ def render_previsao(df_sheets, custo_limpeza, pmax):
 
     # ------------------------------------------------------------------ 🚦 Diagnóstico
     st.subheader("🚦 Diagnóstico das placas")
-    st.caption("Mesmo critério da aba Comparação: faixa do datasheet (20–25 W × G/1000), "
+    st.caption(f"Mesmo critério da aba Comparação: faixa do datasheet ({pmax:.0f}–{pmax + DS_TOLERANCIA_W:.0f} W × G_placa/1000), "
                "contada desde a última limpeza de cada placa.")
 
     col_esq, col_dir = st.columns(2, gap="large")
@@ -1547,7 +1715,7 @@ def render_previsao(df_sheets, custo_limpeza, pmax):
 
     # Faixa prevista do datasheet a partir da irradiação prevista
     if not fut.empty and "irradiancia" in fut:
-        g = fut["irradiancia"].clip(lower=0) / IRRADIANCIA_STC
+        g = irradiancia_plano_placa(fut["timestamp"], fut["irradiancia"])["g_poa"].to_numpy() / IRRADIANCIA_STC
         fut["p_min"] = pmax * g
         fut["p_max"] = (pmax + DS_TOLERANCIA_W) * g
 
@@ -1583,11 +1751,11 @@ def render_previsao(df_sheets, custo_limpeza, pmax):
             ))
     if not fut.empty and "p_min" in fut:
         fig.add_trace(go.Scatter(
-            x=fut["timestamp"], y=fut["p_max"], name="Prevista máx. (25 W)",
+            x=fut["timestamp"], y=fut["p_max"], name=f"Prevista máx. ({pmax + DS_TOLERANCIA_W:.0f} W)",
             line=dict(color="rgba(250,204,21,0.6)", width=1, dash="dot"),
         ))
         fig.add_trace(go.Scatter(
-            x=fut["timestamp"], y=fut["p_min"], name="Prevista mín. (20 W)",
+            x=fut["timestamp"], y=fut["p_min"], name=f"Prevista mín. ({pmax:.0f} W)",
             fill="tonexty", fillcolor="rgba(250,204,21,0.15)",
             line=dict(color="#facc15", width=2, dash="dash"),
         ))
@@ -1651,7 +1819,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 3.1 — aba Previsão (medido × previsto + chuva)</div>',
+        'margin:6px 0">🟢 versão 3.2 — instalação configurável (ângulo, orientação, custos, kWh)</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
@@ -1664,37 +1832,79 @@ def main():
         st.title("⚙️ Configurações")
         st.markdown("---")
 
-        st.subheader("⚡ Minha Placa")
-        potencia_cliente = st.number_input(
-            "Potência da minha placa (W):",
-            min_value=1.0, max_value=50000.0,
-            value=20.0, step=10.0
-        )
+        cfg_salva = carregar_config()
 
-        if st.button("Salvar potência na planilha", use_container_width=True):
-            if gravar_potencia(potencia_cliente):
-                st.success(f"✅ Potência {potencia_cliente:.0f}W salva na planilha!")
+        def _num(rotulo, chave, **kw):
+            return st.number_input(rotulo, value=float(cfg_salva[chave]), key=f"cfg_{chave}", **kw)
+
+        # ---------------------------------------------------------------- ⚡ Placa
+        st.subheader("⚡ Minha Placa (datasheet)")
+        with st.expander("Dados do datasheet", expanded=False):
+            modelo = st.text_input("Modelo da placa", value=cfg_salva["modelo"], key="cfg_modelo")
+            potencia_cliente = _num("Potência nominal Pmax (W)", "potencia_w",
+                                    min_value=1.0, max_value=50000.0, step=5.0)
+            tolerancia = _num("Tolerância positiva (+W)", "tolerancia_w",
+                              min_value=0.0, max_value=5000.0, step=1.0,
+                              help="Datasheet costuma trazer 0 ~ +X W. A faixa esperada vai de Pmax até Pmax + X.")
+            gamma = _num("Coef. de temperatura de Pmax (%/°C)", "gamma_pct",
+                         min_value=-2.0, max_value=0.0, step=0.01, format="%.2f",
+                         help="Normalmente negativo, entre −0,30 e −0,50 %/°C.")
+
+        # ---------------------------------------------------------------- 📐 Instalação
+        st.subheader("📐 Instalação")
+        with st.expander("Ângulo, orientação e local", expanded=False):
+            inclinacao = _num("Inclinação da placa (°)", "inclinacao",
+                              min_value=0.0, max_value=90.0, step=1.0,
+                              help="0° = deitada no chão, 90° = em pé.")
+            azimute = _num("Orientação / azimute (°)", "azimute",
+                           min_value=0.0, max_value=359.0, step=1.0,
+                           help="Para onde a frente da placa aponta: 0 = Norte, 90 = Leste, "
+                                "180 = Sul, 270 = Oeste. Use a bússola do celular.")
+            st.caption(f"🧭 Placa virada para **{direcao_cardinal(azimute)}** ({azimute:.0f}°). "
+                       "No hemisfério sul o ideal é Norte (0°) com inclinação ≈ latitude.")
+            latitude = _num("Latitude", "latitude", min_value=-90.0, max_value=90.0,
+                            step=0.0001, format="%.4f", help="Negativa no hemisfério sul.")
+            longitude = _num("Longitude", "longitude", min_value=-180.0, max_value=180.0,
+                             step=0.0001, format="%.4f", help="Negativa a oeste de Greenwich (todo o Brasil).")
+
+        # ---------------------------------------------------------------- 💧 Custos
+        st.subheader("💧 Custo da Limpeza")
+        with st.expander("Água e outros custos", expanded=False):
+            agua_litros   = _num("Água por limpeza (L)", "agua_litros", min_value=0.0, step=0.5)
+            agua_preco_m3 = _num("Preço da água (R$/m³)", "agua_preco_m3", min_value=0.0, step=0.5, format="%.2f")
+            outros_custos = _num("Outros custos por limpeza (R$)", "outros_custos", min_value=0.0, step=0.5,
+                                 format="%.2f", help="Detergente, mão de obra, deslocamento…")
+        custo_limpeza_atual = custo_total_limpeza(agua_litros, agua_preco_m3, outros_custos)
+
+        # ---------------------------------------------------------------- 💡 Energia
+        st.subheader("💡 Energia")
+        tarifa = _num("Valor do kWh (R$/kWh)", "tarifa_kwh", min_value=0.0, step=0.05, format="%.2f",
+                      help="Veja na conta de luz: valor total ÷ kWh consumidos (com impostos).")
+
+        cfg_atual = {
+            "modelo": modelo.strip() or CONFIG_PADRAO["modelo"],
+            "potencia_w": potencia_cliente, "tolerancia_w": tolerancia, "gamma_pct": gamma,
+            "inclinacao": inclinacao, "azimute": azimute, "latitude": latitude, "longitude": longitude,
+            "agua_litros": agua_litros, "agua_preco_m3": agua_preco_m3, "outros_custos": outros_custos,
+            "tarifa_kwh": tarifa,
+        }
+        aplicar_config(cfg_atual)
+
+        card("Custo total da limpeza", _fmt_rs(custo_limpeza_atual), "por limpeza", "#a78bfa")
+
+        alterado = any(cfg_atual[k] != cfg_salva[k] for k in cfg_atual)
+        if alterado:
+            st.warning("⚠️ Alterações em uso só nesta sessão — salve para valer sempre (inclusive nos alertas).")
+        if st.button("💾 Salvar configuração", use_container_width=True, disabled=not alterado):
+            if gravar_config(cfg_atual):
+                st.success("✅ Configuração salva na planilha!")
                 st.cache_data.clear()
                 st.rerun()
 
-
-        st.markdown("---")
-
-        # ============================================================================
-        # 💧 CUSTO DE LIMPEZA — água utilizada (editável)
-        # ============================================================================
-        st.subheader("💧 Custo de Limpeza")
-        st.caption("Custo da **água** usada na limpeza. Ajuste conforme sua realidade.")
-
-        with st.expander("Ajustar água da limpeza", expanded=False):
-            agua_litros    = st.number_input("Água por limpeza (L)", min_value=0.0, value=AGUA_LITROS_PADRAO, step=0.5)
-            agua_preco_m3  = st.number_input("Preço da água (R$/m³)", min_value=0.0, value=AGUA_PRECO_M3_PADRAO, step=0.5, format="%.2f")
-
-        # Custo total desta limpeza (R$), usado em toda a análise e decisão
-        custo_limpeza_atual = custo_total_limpeza(agua_litros, agua_preco_m3)
-        card("Custo total da limpeza", f"R$ {custo_limpeza_atual:.2f}", "por limpeza", "#a78bfa")
-
-        st.markdown("---")
+        def _restaurar_padrao():
+            for k, v in CONFIG_PADRAO.items():
+                st.session_state[f"cfg_{k}"] = v
+        st.button("↩️ Voltar ao padrão do TCC", use_container_width=True, on_click=_restaurar_padrao)
 
         st.markdown("---")
         st.markdown("**TCC Solar**\n- Dados via API climática\n- Python + Streamlit")
