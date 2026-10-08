@@ -10,6 +10,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
@@ -1559,6 +1560,106 @@ def render_comparacao(custo_limpeza, pmax):
         with col:
             _coluna_julgamento(df, placa, a, pmax, custo_limpeza, faixa_pot, origem, agora)
 
+    # 📐 Explicação da geometria / zona morta, com os dados do período julgado
+    candidatos = [d[0] for d in dados.values() if not d[0].empty]
+    df_geo = max(candidatos, key=len) if candidatos else df_agora
+    _secao_geometria(df_geo, agora)
+
+ELEV_MIN_JANELA = 10.0   # ° — só para a janela "teórica" do dia (sem irradiação medida)
+
+def janela_do_dia(dia):
+    """Janela geométrica de julgamento de um dia: horários em que o sol está acima de
+    ELEV_MIN_JANELA e a no máximo AOI_MAX_JULGAMENTO da perpendicular da placa.
+    Devolve (início, fim) como texto HH:MM, ou (None, None) se a janela não abre."""
+    ts = pd.date_range(datetime.combine(dia, datetime.min.time()) + pd.Timedelta(hours=4),
+                       periods=16 * 12, freq="5min")
+    geo = irradiancia_plano_placa(ts, np.full(len(ts), 500.0))
+    ok = (geo["aoi"].to_numpy() <= AOI_MAX_JULGAMENTO) & (geo["elev_sol"].to_numpy() >= ELEV_MIN_JANELA)
+    if not ok.any():
+        return None, None
+    dentro = ts[ok]
+    return dentro.min().strftime("%H:%M"), dentro.max().strftime("%H:%M")
+
+def _secao_geometria(df, agora):
+    """Seção explicativa: sensor horizontal x irradiância na placa, ângulo do sol e zona morta."""
+    with st.expander("📐 Como o julgamento funciona — inclinação da placa e zona morta", expanded=False):
+        st.markdown(
+            f"O sensor de irradiação fica **nivelado** e mede a irradiância horizontal. As placas ficam "
+            f"**inclinadas {PLACA_INCLINACAO_GRAUS:.0f}°** e viradas para **{direcao_cardinal(PLACA_AZIMUTE_GRAUS)} "
+            f"({PLACA_AZIMUTE_GRAUS:.0f}°)**, então recebem outra quantidade de luz conforme a posição do sol. "
+            "Antes de comparar com o datasheet, o sistema converte cada leitura do sensor para o **plano da placa**: "
+            "calcula a posição do sol no horário da leitura, separa a luz direta da difusa (modelo de Erbs), "
+            "projeta as duas na placa (modelo isotrópico) e desconta a reflexão do vidro com sol baixo (IAM)."
+        )
+        st.markdown(
+            f"Quando o sol fica muito de lado (mais de **{AOI_MAX_JULGAMENTO:.0f}°** da perpendicular da placa) "
+            f"ou a irradiação na placa fica abaixo de **{IRRAD_MIN_JULGAMENTO:.0f} W/m²**, a conta perde precisão: "
+            "essa é a **zona morta**. As leituras continuam no gráfico (em cinza), mas não entram no julgamento "
+            "limpa/suja nem no cálculo da perda. Como a posição do sol é recalculada para cada data, "
+            "a janela muda sozinha com as estações."
+        )
+
+        hoje = agora.date()
+        ano = hoje.year
+        j_hoje = janela_do_dia(hoje)
+        j_inv = janela_do_dia(datetime(ano, 6, 21).date())
+        j_ver = janela_do_dia(datetime(ano, 12, 21).date())
+        txt = lambda j: f"{j[0]} – {j[1]}" if j[0] else "não abre"
+
+        geo_agora = irradiancia_plano_placa([agora], [500.0]).iloc[0]
+        aoi_agora = geo_agora["aoi"] if geo_agora["elev_sol"] > 0 else None
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            card("Janela de hoje", txt(j_hoje), "horário em que julga", "#22c55e")
+        with c2:
+            card("Sol x placa agora", _fmt(aoi_agora, 0) if aoi_agora is not None else "noite",
+                 "° (0° = sol de frente)", "#facc15" if aoi_agora is not None and aoi_agora <= AOI_MAX_JULGAMENTO else "#94a3b8")
+        with c3:
+            card("Inverno (21/jun)", txt(j_inv), "janela geométrica", "#67e8f9")
+        with c4:
+            card("Verão (21/dez)", txt(j_ver), "janela geométrica", "#f59e0b")
+
+        if df is None or df.empty or "field7" not in df:
+            st.info("Sem leituras no período para desenhar os gráficos.")
+            return
+
+        d = df[["timestamp", "field7"]].dropna().sort_values("timestamp").reset_index(drop=True)
+        if d.empty:
+            st.info("Sem leituras de irradiação no período.")
+            return
+        d = d.join(_geometria(d))
+        d["janela"] = (d["aoi"] <= AOI_MAX_JULGAMENTO) & (d["g_poa"] >= IRRAD_MIN_JULGAMENTO)
+        pct = d["janela"].mean() * 100
+
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.55, 0.45],
+                            subplot_titles=("Irradiação: sensor (horizontal) x o que chega na placa (W/m²)",
+                                            "Ângulo entre o sol e a perpendicular da placa (°)"))
+        fig.add_trace(go.Scatter(x=d["timestamp"], y=d["field7"], name="Sensor (horizontal)",
+                                 line=dict(color="#94a3b8", width=1.5, dash="dot")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=d["timestamp"], y=d["g_poa"], name="Na placa (corrigida)",
+                                 line=dict(color="#facc15", width=2.5)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=d["timestamp"], y=d["aoi"].where(d["elev_sol"] > 0), name="Ângulo do sol",
+                                 line=dict(color="#38bdf8", width=2.5)), row=2, col=1)
+        fig.add_trace(go.Scatter(x=d["timestamp"], y=d["aoi"].where(~d["janela"] & (d["elev_sol"] > 0)),
+                                 name="Zona morta (não julga)", mode="markers",
+                                 marker=dict(color="#94a3b8", size=5)), row=2, col=1)
+        fig.add_hrect(y0=0, y1=AOI_MAX_JULGAMENTO, fillcolor="rgba(34,197,94,0.10)", line_width=0, row=2, col=1)
+        fig.add_hrect(y0=AOI_MAX_JULGAMENTO, y1=120, fillcolor="rgba(148,163,184,0.12)", line_width=0, row=2, col=1)
+        fig.add_hline(y=AOI_MAX_JULGAMENTO, line=dict(color="#e2e8f0", dash="dash", width=1), row=2, col=1,
+                      annotation_text=f"limite {AOI_MAX_JULGAMENTO:.0f}°", annotation_position="top left")
+        fig.update_layout(**LAY, height=560)
+        fig.update_yaxes(gridcolor="#1e293b", linecolor="#334155")
+        fig.update_xaxes(gridcolor="#1e293b", linecolor="#334155")
+        fig.update_yaxes(title_text="W/m²", row=1, col=1)
+        fig.update_yaxes(title_text="°", range=[120, 0], row=2, col=1)
+        st.plotly_chart(fig, use_container_width=True, key="cmp_geometria")
+        st.caption(
+            f"{pct:.0f}% das leituras do período ficaram dentro da janela de julgamento. "
+            "No gráfico de baixo o eixo é invertido: quanto mais alto, mais de frente o sol está para a placa. "
+            "Inclinação, orientação e local vêm da barra lateral (📐 Instalação)."
+        )
+
 # ============================================================================
 # 🌤️ ABA: PREVISÃO — diagnóstico das placas + medido (passado) x previsto (futuro)
 # ============================================================================
@@ -1819,7 +1920,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 3.2 — instalação configurável (ângulo, orientação, custos, kWh)</div>',
+        'margin:6px 0">🟢 versão 3.3 — instalação configurável + explicação da zona morta</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
