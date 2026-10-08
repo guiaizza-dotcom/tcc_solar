@@ -186,13 +186,28 @@ hr{ border-color:rgba(30,96,145,.5)!important; }
 # 💧 CUSTO DE LIMPEZA — calculado a partir da água utilizada
 # ============================================================================
 
-def custo_total_limpeza(agua_litros, agua_preco_m3, outros_custos=0.0):
+def detalhar_custo_limpeza(agua_litros, agua_preco_m3, produto_rs=0.0, mao_obra_rs=0.0,
+                           deslocamento_rs=0.0, outros_rs=0.0):
     """
-    Custo de UMA limpeza (R$):
-      água  = (litros / 1000) m³ × preço do m³
-      total = água + outros custos (detergente, mão de obra, deslocamento…)
+    Custo de UMA limpeza (R$), item por item:
+      água         = (litros / 1000) m³ × preço do m³
+      produto      = detergente / produto de limpeza gasto
+      mão de obra  = quem limpa (próprio tempo ou serviço contratado)
+      deslocamento = ida até as placas, aluguel de escada/equipamento…
+      outros       = desgaste de rodo/escova, EPI etc.
+    Devolve {item: R$} e o total.
     """
-    return (agua_litros / 1000.0) * agua_preco_m3 + outros_custos
+    itens = {
+        "Água": (agua_litros / 1000.0) * agua_preco_m3,
+        "Produto de limpeza": produto_rs,
+        "Mão de obra": mao_obra_rs,
+        "Deslocamento / equipamento": deslocamento_rs,
+        "Outros": outros_rs,
+    }
+    return itens, sum(itens.values())
+
+# Detalhe do custo em uso (preenchido pela barra lateral; usado nos textos da decisão)
+CUSTO_ITENS = {}
 
 # ============================================================================
 # ⚙️ CONFIGURAÇÃO DA INSTALAÇÃO — editável na barra lateral e salva na planilha
@@ -215,7 +230,10 @@ CONFIG_PADRAO = {
     "longitude":     -47.2181,
     "agua_litros":   5.0,
     "agua_preco_m3": 5.50,
-    "outros_custos": 0.0,       # R$ por limpeza além da água
+    "produto_rs":    0.0,       # R$ de detergente/produto por limpeza
+    "mao_obra_rs":   0.0,       # R$ de mão de obra por limpeza
+    "deslocamento_rs": 0.0,     # R$ de deslocamento/equipamento por limpeza
+    "outros_custos": 0.0,       # R$ de outros custos por limpeza
     "tarifa_kwh":    0.75,      # R$/kWh
 }
 
@@ -1298,6 +1316,7 @@ def _avaliar_placa(df, placa, pmax, custo_limpeza):
         "e_max": pv["e_max"] if pv else 0.0,
         "perda_pct": pv["perda_pct"] if pv else 0.0,
         "perda_rs": pv["perda_rs"] if pv else 0.0,
+        "perda_wh": pv["perda_wh"] if pv else 0.0,
         "rend_pct": pv["rend_pct"] if pv else 0.0,
         "n_sol": len(pv["df"]) if pv else 0,
     }
@@ -1361,14 +1380,26 @@ def _bloco_requisitos(a, custo_limpeza):
     linhas = (
         linha(a["req_sujeira"], "Abaixo do mínimo do datasheet além do limiar",
               f'{a["perda_pct"]:.1f}% {sinal_suj} {LIMIAR_SUJEIRA:.0f}%')
-        + linha(a["req_custo"], "Perda por dia paga a limpeza",
+        + linha(a["req_custo"], "Perda por dia paga a limpeza (custo total)",
                 f'{_fmt_rs(a["perda_dia"])}/dia {sinal_cus} {_fmt_rs(custo_limpeza)}')
     )
+
+    # 💸 Quanto deixou de ser gerado por estar abaixo do mínimo do datasheet
+    perda_kwh = a["perda_wh"] / 1000.0
+    linhas_perda = (
+        f'<div class="req-linha"><span>💸 Deixou de gerar desde a limpeza</span>'
+        f'<span class="req-valor">{_fmt(a["perda_wh"], 1)} Wh = <b>{_fmt_rs(a["perda_rs"])}</b></span></div>'
+        f'<div class="req-linha"><span>📆 No ritmo atual, em 30 dias</span>'
+        f'<span class="req-valor">{_fmt_rs(a["perda_dia"] * 30)} '
+        f'({_fmt(a["perda_dia"] * 30 / TARIFA_KWH * 1000 if TARIFA_KWH else 0, 0)} Wh)</span></div>'
+    )
+    itens = [f"{k.lower()} {_fmt_rs(v)}" for k, v in CUSTO_ITENS.items() if v > 0]
+    composicao = f"Custo da limpeza = {' + '.join(itens)}" if itens else ""
 
     if a["veredito"] == "SEM SOL":
         dec, bg, bd = "🌙 Aguardando sol para julgar", "#1e293b", "#64748b"
     elif a["compensa"]:
-        dec, bg, bd = "🧽 LIMPAR AGORA — a perda já paga a água", "#4a1416", "#ef4444"
+        dec, bg, bd = "🧽 LIMPAR AGORA — a perda já paga o custo da limpeza", "#4a1416", "#ef4444"
     elif a["veredito"] == "SUJA":
         pb = f"~{a['payback']:.1f} dias" if a["payback"] else "—"
         dec, bg, bd = f"⏳ AGUARDAR — a limpeza se paga em {pb}", "#4a320b", "#f59e0b"
@@ -1377,9 +1408,13 @@ def _bloco_requisitos(a, custo_limpeza):
 
     st.markdown(
         f'<div class="req"><div class="req-titulo">Requisitos de limpeza</div>{linhas}'
+        f'<div class="req-titulo" style="margin-top:10px">Prejuízo pela sujeira (tarifa R$ {TARIFA_KWH:.2f}/kWh)</div>'
+        f'{linhas_perda}'
         f'<div class="req-decisao" style="background:{bg};border-color:{bd};color:#f1f5f9">{dec}</div></div>',
         unsafe_allow_html=True,
     )
+    if composicao:
+        st.caption(composicao)
 
 def _controles_limpeza(placa, agora):
     """Botões para registrar a limpeza DESTA placa — o julgamento recomeça a partir daí."""
@@ -1791,7 +1826,8 @@ def render_previsao(df_sheets, custo_limpeza, pmax):
             st.caption(f"📍 Desde {origem} — {a['n_sol']} leituras com sol.")
             if a["compensa"]:
                 alertas.append(f"{placa['nome']}: {a['perda_pct']:.1f}% abaixo do mínimo do datasheet, "
-                               f"perda {_fmt_rs(a['perda_dia'])}/dia ≥ custo {_fmt_rs(custo_limpeza)}.")
+                               f"perda {_fmt_rs(a['perda_dia'])}/dia ≥ custo {_fmt_rs(custo_limpeza)}; "
+                               f"já deixou de gerar {_fmt_rs(a['perda_rs'])} desde a limpeza.")
 
     # 📧 Alerta automático por e-mail quando alguma placa compensa limpar
     if alertas:
@@ -1932,7 +1968,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 3.4 — correção do pico da previsão ao nascer do sol</div>',
+        'margin:6px 0">🟢 versão 3.5 — custo de limpeza detalhado + dinheiro perdido pela sujeira</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
@@ -1982,12 +2018,22 @@ def main():
 
         # ---------------------------------------------------------------- 💧 Custos
         st.subheader("💧 Custo da Limpeza")
-        with st.expander("Água e outros custos", expanded=False):
+        with st.expander("Custos por limpeza", expanded=False):
             agua_litros   = _num("Água por limpeza (L)", "agua_litros", min_value=0.0, step=0.5)
             agua_preco_m3 = _num("Preço da água (R$/m³)", "agua_preco_m3", min_value=0.0, step=0.5, format="%.2f")
-            outros_custos = _num("Outros custos por limpeza (R$)", "outros_custos", min_value=0.0, step=0.5,
-                                 format="%.2f", help="Detergente, mão de obra, deslocamento…")
-        custo_limpeza_atual = custo_total_limpeza(agua_litros, agua_preco_m3, outros_custos)
+            produto_rs    = _num("Produto de limpeza (R$)", "produto_rs", min_value=0.0, step=0.10, format="%.2f",
+                                 help="Detergente neutro ou produto específico gasto em UMA limpeza.")
+            mao_obra_rs   = _num("Mão de obra (R$)", "mao_obra_rs", min_value=0.0, step=1.0, format="%.2f",
+                                 help="Valor do serviço contratado, ou do seu tempo (horas × R$/hora).")
+            deslocamento_rs = _num("Deslocamento / equipamento (R$)", "deslocamento_rs", min_value=0.0,
+                                   step=1.0, format="%.2f",
+                                   help="Combustível até o local, aluguel de escada, andaime…")
+            outros_custos = _num("Outros (R$)", "outros_custos", min_value=0.0, step=0.5, format="%.2f",
+                                 help="Desgaste de rodo/escova, EPI etc., por limpeza.")
+        itens_custo, custo_limpeza_atual = detalhar_custo_limpeza(
+            agua_litros, agua_preco_m3, produto_rs, mao_obra_rs, deslocamento_rs, outros_custos)
+        CUSTO_ITENS.clear()
+        CUSTO_ITENS.update(itens_custo)
 
         # ---------------------------------------------------------------- 💡 Energia
         st.subheader("💡 Energia")
@@ -1998,12 +2044,16 @@ def main():
             "modelo": modelo.strip() or CONFIG_PADRAO["modelo"],
             "potencia_w": potencia_cliente, "tolerancia_w": tolerancia, "gamma_pct": gamma,
             "inclinacao": inclinacao, "azimute": azimute, "latitude": latitude, "longitude": longitude,
-            "agua_litros": agua_litros, "agua_preco_m3": agua_preco_m3, "outros_custos": outros_custos,
+            "agua_litros": agua_litros, "agua_preco_m3": agua_preco_m3, "produto_rs": produto_rs,
+            "mao_obra_rs": mao_obra_rs, "deslocamento_rs": deslocamento_rs, "outros_custos": outros_custos,
             "tarifa_kwh": tarifa,
         }
         aplicar_config(cfg_atual)
 
         card("Custo total da limpeza", _fmt_rs(custo_limpeza_atual), "por limpeza", "#a78bfa")
+        detalhe = " · ".join(f"{k} {_fmt_rs(v)}" for k, v in itens_custo.items() if v > 0)
+        if detalhe:
+            st.caption(detalhe)
 
         alterado = any(cfg_atual[k] != cfg_salva[k] for k in cfg_atual)
         if alterado:
