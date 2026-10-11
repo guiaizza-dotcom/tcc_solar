@@ -1182,7 +1182,9 @@ def _avaliar_placa(df, placa, pmax, custo_limpeza):
       veredito    : 'LIMPA' | 'SUJA' | 'SEM SOL'
       posicao     : 'abaixo' | 'dentro' | 'acima' da faixa do datasheet
       req_sujeira : perda (% abaixo do mínimo garantido) > LIMIAR_SUJEIRA
-      req_custo   : perda (R$/dia) ≥ custo da limpeza
+      req_custo   : perda ACUMULADA desde a limpeza (R$) ≥ custo da limpeza
+                    (regra do intervalo ótimo: limpa quando o prejuízo somado
+                     se iguala ao custo de limpar)
       compensa    : SUJA  e  req_custo
     """
     ultima = df.iloc[-1:]
@@ -1206,6 +1208,9 @@ def _avaliar_placa(df, placa, pmax, custo_limpeza):
     dias = max(1, (df["timestamp"].max() - df["timestamp"].min()).days + 1)
     a["perda_dia"] = a["perda_rs"] / dias
     a["payback"] = custo_limpeza / a["perda_dia"] if a["perda_dia"] > 0 else None
+    # Quanto ainda falta a perda acumulada alcançar o custo, e em quantos dias (no ritmo atual)
+    a["falta_rs"] = max(0.0, custo_limpeza - a["perda_rs"])
+    a["dias_p_limpar"] = a["falta_rs"] / a["perda_dia"] if a["perda_dia"] > 0 else None
 
     if a["e_real"] < a["e_min"]:
         a["posicao"] = "abaixo"
@@ -1222,7 +1227,7 @@ def _avaliar_placa(df, placa, pmax, custo_limpeza):
         a["veredito"] = "LIMPA"
 
     a["req_sujeira"] = a["perda_pct"] > LIMIAR_SUJEIRA
-    a["req_custo"] = a["perda_dia"] >= custo_limpeza
+    a["req_custo"] = a["perda_rs"] >= custo_limpeza
     a["compensa"] = a["veredito"] == "SUJA" and a["req_custo"]
     return a
 
@@ -1262,8 +1267,8 @@ def _bloco_requisitos(a, custo_limpeza):
     linhas = (
         linha(a["req_sujeira"], "Abaixo do mínimo do datasheet além do limiar",
               f'{a["perda_pct"]:.1f}% {sinal_suj} {LIMIAR_SUJEIRA:.0f}%')
-        + linha(a["req_custo"], "Perda por dia paga a limpeza (custo total)",
-                f'{_fmt_rs(a["perda_dia"])}/dia {sinal_cus} {_fmt_rs(custo_limpeza)}')
+        + linha(a["req_custo"], "Perda acumulada desde a limpeza paga a limpeza",
+                f'{_fmt_rs(a["perda_rs"])} {sinal_cus} {_fmt_rs(custo_limpeza)}')
     )
 
     # 💸 Quanto deixou de ser gerado por estar abaixo do mínimo do datasheet
@@ -1282,8 +1287,12 @@ def _bloco_requisitos(a, custo_limpeza):
     elif a["compensa"]:
         dec, bg, bd = "🧽 LIMPAR AGORA — a perda já paga o custo da limpeza", "#4a1416", "#ef4444"
     elif a["veredito"] == "SUJA":
-        pb = f"~{a['payback']:.1f} dias" if a["payback"] else "—"
-        dec, bg, bd = f"⏳ AGUARDAR — a limpeza se paga em {pb}", "#4a320b", "#f59e0b"
+        if a["dias_p_limpar"] is not None:
+            dec = (f"⏳ AGUARDAR — faltam {_fmt_rs(a['falta_rs'])} de perda "
+                   f"(~{a['dias_p_limpar']:.1f} dias no ritmo atual)")
+        else:
+            dec = f"⏳ AGUARDAR — faltam {_fmt_rs(a['falta_rs'])} de perda para pagar a limpeza"
+        bg, bd = "#4a320b", "#f59e0b"
     else:
         dec, bg, bd = "✅ NÃO PRECISA LIMPAR", "#0b3b24", "#22c55e"
 
@@ -1417,7 +1426,9 @@ def render_comparacao(custo_limpeza, pmax):
         f"Gerou pelo menos o mínimo garantido → **LIMPA**; ficou mais de {LIMIAR_SUJEIRA:.0f}% abaixo → **SUJA**. "
         f"Só entram no julgamento leituras com irradiação na placa ≥ {IRRAD_MIN_JULGAMENTO:.0f} W/m² e sol a "
         f"no máximo {AOI_MAX_JULGAMENTO:.0f}° da perpendicular da placa — fora disso (sol muito de lado, fim de tarde) "
-        f"a leitura aparece no gráfico em cinza, mas não conta."
+        f"a leitura aparece no gráfico em cinza, mas não conta. "
+        f"**Limpar** quando a placa está SUJA **e** o que ela deixou de gerar desde a última limpeza "
+        f"(somado, em R$) já é maior ou igual ao custo da limpeza."
     )
 
     m1, m2 = st.columns([3, 1])
@@ -1708,8 +1719,8 @@ def render_previsao(df_sheets, custo_limpeza, pmax):
             st.caption(f"📍 Desde {origem} — {a['n_sol']} leituras na janela de julgamento.")
             if a["compensa"]:
                 alertas.append(f"{placa['nome']}: {a['perda_pct']:.1f}% abaixo do mínimo do datasheet, "
-                               f"perda {_fmt_rs(a['perda_dia'])}/dia ≥ custo {_fmt_rs(custo_limpeza)}; "
-                               f"já deixou de gerar {_fmt_rs(a['perda_rs'])} desde a limpeza.")
+                               f"já deixou de gerar {_fmt_rs(a['perda_rs'])} desde a limpeza "
+                               f"(≥ custo da limpeza {_fmt_rs(custo_limpeza)}).")
 
     # 📧 Alerta automático por e-mail quando alguma placa compensa limpar
     if alertas:
