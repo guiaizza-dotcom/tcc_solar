@@ -59,6 +59,9 @@ IRRADIANCIA_STC = 1000.0
 TARIFA_KWH = 0.75
 LIMIAR_SUJEIRA = 10.0
 EMAIL_ALERTA_PADRAO = "bittoleoguio@gmail.com"  # usado só se a planilha ainda não tiver e-mail salvo
+# E-mails que SEMPRE recebem o alerta (entram na lista mesmo se a planilha falhar)
+EMAILS_FIXOS = ["lucas.silva264@al.unieduk.com.br"]
+ALERTA_CELULA = "M2"  # guarda qual alerta já foi enviado (placa + data da limpeza) para não repetir
 
 # --- 📍 Local das placas (padrão; editável na barra lateral) ---
 LATITUDE  = -23.0903
@@ -311,10 +314,34 @@ def carregar_emails_alerta():
     try:
         valor = _abrir_planilha().acell("I2").value
         if not valor or not valor.strip():
-            return [EMAIL_ALERTA_PADRAO]
-        return [e.strip() for e in valor.split(",") if e.strip()][:10]
+            lista = [EMAIL_ALERTA_PADRAO]
+        else:
+            lista = [e.strip() for e in valor.split(",") if e.strip()]
     except Exception:
-        return []
+        lista = []
+    return _com_emails_fixos(lista)
+
+def _com_emails_fixos(lista):
+    """Garante que os EMAILS_FIXOS estejam sempre na lista (sem duplicar), até 10."""
+    final = list(lista)
+    for e in EMAILS_FIXOS:
+        if e.lower() not in [x.lower() for x in final]:
+            final.append(e)
+    return final[:10]
+
+def carregar_alerta_enviado():
+    """Lê da planilha a chave do último alerta enviado ('' se nenhum ou erro)."""
+    try:
+        return (_abrir_planilha().acell(ALERTA_CELULA).value or "").strip()
+    except Exception:
+        return None  # None = planilha indisponível
+
+def gravar_alerta_enviado(chave):
+    try:
+        _abrir_planilha().update(ALERTA_CELULA, [[chave]])
+        return True
+    except Exception:
+        return False
 
 def gravar_ultima_limpeza(data_hora, celula="J2"):
     """Grava a data/hora (horário de Brasília) da última limpeza de UMA placa na
@@ -616,6 +643,7 @@ def render_aba_email():
 
     if "emails_alerta" not in st.session_state:
         st.session_state["emails_alerta"] = carregar_emails_alerta()
+    st.session_state["emails_alerta"] = _com_emails_fixos(st.session_state["emails_alerta"])
     if "ultimo_alerta_enviado" not in st.session_state:
         st.session_state["ultimo_alerta_enviado"] = False
     if "erro_email" not in st.session_state:
@@ -645,7 +673,7 @@ def render_aba_email():
     def _remover_email(indice):
         def _callback():
             lista = list(st.session_state.get("emails_alerta", []))
-            if 0 <= indice < len(lista):
+            if 0 <= indice < len(lista) and lista[indice].lower() not in [f.lower() for f in EMAILS_FIXOS]:
                 lista.pop(indice)
                 st.session_state["emails_alerta"] = lista
                 if gravar_emails_alerta(lista):
@@ -667,10 +695,13 @@ def render_aba_email():
                     unsafe_allow_html=True,
                 )
             with col_e2:
-                st.button(
-                    "🗑️ Remover", key=f"remover_email_{i}", use_container_width=True,
-                    on_click=_remover_email(i),
-                )
+                if e.lower() in [f.lower() for f in EMAILS_FIXOS]:
+                    st.caption("📌 fixo")
+                else:
+                    st.button(
+                        "🗑️ Remover", key=f"remover_email_{i}", use_container_width=True,
+                        on_click=_remover_email(i),
+                    )
 
     if len(emails) < 10:
         col_a1, col_a2 = st.columns([4, 1])
@@ -722,37 +753,47 @@ def render_aba_email():
             else:
                 st.error(f"❌ Falha ao enviar: {detalhe}")
 
-def verificar_e_enviar_alerta_email(compensa_limpar: bool, mensagem_alerta: str):
+def verificar_e_enviar_alerta_email(compensa_limpar: bool, mensagem_alerta: str, chave_alerta: str = ""):
     """
-    Chamada a cada carregamento da página: se 'compensa_limpar' for True e houver
-    e-mails cadastrados na sessão, envia o alerta automaticamente para TODOS eles
-    (uma vez só por ocorrência, evitando reenviar a cada atualização da página).
+    Chamada a cada carregamento da página. Se 'compensa_limpar' for True, envia o
+    alerta para TODOS os e-mails da lista — UMA vez por ocorrência.
+
+    'chave_alerta' identifica a ocorrência (placa + data da última limpeza). Ela é
+    gravada na planilha (célula ALERTA_CELULA) só quando o envio dá certo, então:
+      • não reenvia a cada atualização nem a cada pessoa que abre o app;
+      • se o envio falhar, tenta de novo no próximo carregamento;
+      • depois de "Limpei agora", a chave muda e um novo alerta pode sair.
     """
-    emails = st.session_state.get("emails_alerta")
-    if emails is None:
-        emails = carregar_emails_alerta()
-        st.session_state["emails_alerta"] = emails
-    emails_validos = [e for e in emails if email_valido(e)]
+    if not compensa_limpar:
+        return
+
+    emails_validos = [e for e in _com_emails_fixos(carregar_emails_alerta()) if email_valido(e)]
     if not emails_validos:
         return
 
     remetente, senha_app = _segredo("gmail_remetente", ""), _segredo("gmail_senha_app", "")
     if not remetente or not senha_app:
-        return  # credenciais não configuradas em secrets.toml — nada a fazer
+        st.warning("📧 A limpeza compensa, mas o alerta por e-mail não saiu: faltam "
+                   "'gmail_remetente' / 'gmail_senha_app' nos Secrets do Streamlit.")
+        return
 
-    if compensa_limpar and not st.session_state.get("ultimo_alerta_enviado", False):
-        sucesso, _ = enviar_email_gmail(
-            remetente, senha_app, emails_validos,
-            "TCC Solar - Limpeza da placa recomendada",
-            f"{mensagem_alerta}\n\nAbra o painel: {APP_URL}",
-        )
-        st.session_state["ultimo_alerta_enviado"] = True
-        if sucesso:
-            st.toast(f"📧 Alerta enviado para {len(emails_validos)} e-mail(s)!")
-    elif not compensa_limpar:
-        # Reseta a trava assim que a placa deixa de precisar de limpeza,
-        # para que um novo alerta seja disparado na próxima vez que voltar a compensar.
-        st.session_state["ultimo_alerta_enviado"] = False
+    ja_enviado = carregar_alerta_enviado()
+    if ja_enviado is None:  # planilha indisponível → trava só nesta sessão
+        ja_enviado = st.session_state.get("ultimo_alerta_chave", "")
+    if chave_alerta and ja_enviado == chave_alerta:
+        return  # este alerta já foi enviado
+
+    sucesso, detalhe = enviar_email_gmail(
+        remetente, senha_app, emails_validos,
+        "TCC Solar - Limpeza da placa recomendada",
+        f"{mensagem_alerta}\n\nAbra o painel: {APP_URL}",
+    )
+    if sucesso:
+        st.session_state["ultimo_alerta_chave"] = chave_alerta
+        gravar_alerta_enviado(chave_alerta)
+        st.toast(f"📧 Alerta enviado para {len(emails_validos)} e-mail(s)!")
+    else:
+        st.error(f"📧 Falha ao enviar o alerta de limpeza: {detalhe}")
 
 # ============================================================================
 # ☀️ ABA: MINHA PLACA AO VIVO (ThingSpeak)
@@ -1707,7 +1748,7 @@ def render_previsao(df_sheets, custo_limpeza, pmax):
                "contada desde a última limpeza de cada placa.")
 
     col_esq, col_dir = st.columns(2, gap="large")
-    alertas = []
+    alertas, chaves = [], []
     for col, placa in ((col_esq, PLACA_LIMPA), (col_dir, PLACA_SUJA)):
         a, origem = _dados_placa_desde_limpeza(placa, pmax, custo_limpeza, hoje)
         with col:
@@ -1718,15 +1759,15 @@ def render_previsao(df_sheets, custo_limpeza, pmax):
             _bloco_requisitos(a, custo_limpeza)
             st.caption(f"📍 Desde {origem} — {a['n_sol']} leituras na janela de julgamento.")
             if a["compensa"]:
+                chaves.append(f"{placa['nome']}@{origem}")
                 alertas.append(f"{placa['nome']}: {a['perda_pct']:.1f}% abaixo do mínimo do datasheet, "
                                f"já deixou de gerar {_fmt_rs(a['perda_rs'])} desde a limpeza "
                                f"(≥ custo da limpeza {_fmt_rs(custo_limpeza)}).")
 
     # 📧 Alerta automático por e-mail quando alguma placa compensa limpar
     if alertas:
-        verificar_e_enviar_alerta_email(True, "🚨 LIMPEZA RECOMENDADA\n\n" + "\n".join(alertas))
-    else:
-        verificar_e_enviar_alerta_email(False, "")
+        verificar_e_enviar_alerta_email(True, "🚨 LIMPEZA RECOMENDADA\n\n" + "\n".join(alertas),
+                                        " | ".join(chaves))
 
     st.markdown("---")
 
