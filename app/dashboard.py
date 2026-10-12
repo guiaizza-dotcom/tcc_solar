@@ -274,7 +274,7 @@ def aplicar_config(cfg):
     """Coloca a configuração em uso: todas as funções de cálculo leem estes globais."""
     global DS_MODELO, DS_TOLERANCIA_W, DS_GAMMA_PMAX, TARIFA_KWH
     global PLACA_INCLINACAO_GRAUS, PLACA_AZIMUTE_GRAUS, LATITUDE, LONGITUDE, METODO_JULGAMENTO
-    METODO_JULGAMENTO      = cfg.get("metodo", "ml")
+    METODO_JULGAMENTO      = "ml"   # sempre ML (sem opção na tela)
     DS_MODELO              = cfg["modelo"]
     DS_TOLERANCIA_W        = float(cfg["tolerancia_w"])
     DS_GAMMA_PMAX          = float(cfg["gamma_pct"]) / 100.0
@@ -1571,8 +1571,7 @@ def render_comparacao(custo_limpeza, pmax):
             f"placa **limpa** geraria em cada leitura, a partir da irradiação do sensor, da posição do sol em relação "
             f"à placa e das temperaturas. Entram só leituras de **7h às 13h** com irradiação ≥ "
             f"{info_ml['irr_min']:.0f} W/m² (1 a cada 15 min). Gerou menos de "
-            f"{info_ml['limiar_indice']:.0%} do esperado → **SUJA**. "
-            f"Para usar a faixa do datasheet, troque o método na barra lateral."
+            f"{info_ml['limiar_indice']:.0%} do esperado → **SUJA**."
         )
     elif METODO_JULGAMENTO == "ml":
         st.warning("🤖 O modelo de ML não carregou — usando a faixa do datasheet. Veja a aba 🔧 Admin ML.")
@@ -2298,7 +2297,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 4.0 — 🤖 Machine Learning (XGBoost) + aba Admin</div>',
+        'margin:6px 0">🟢 versão 4.1 — 🤖 julgamento só por Machine Learning (XGBoost)</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
@@ -2318,16 +2317,10 @@ def main():
         def _num(rotulo, chave, **kw):
             return st.number_input(rotulo, key=f"cfg_{chave}", **kw)
 
-        # ---------------------------------------------------------------- 🧠 Método
-        st.subheader("🧠 Método de julgamento")
-        opcoes_metodo = {"ml": "🤖 Machine Learning (XGBoost)", "datasheet": "📄 Faixa do datasheet"}
-        if st.session_state.get("cfg_metodo") not in opcoes_metodo:
-            st.session_state["cfg_metodo"] = "ml"
-        metodo = st.radio("Como julgar se a placa está suja", list(opcoes_metodo),
-                          format_func=opcoes_metodo.get, key="cfg_metodo",
-                          label_visibility="collapsed")
-        if metodo == "ml" and not ml_disponivel():
-            st.error("Modelo de ML não carregou — usando o datasheet. Veja a aba 🔧 Admin ML.")
+        # 🤖 Julgamento sempre pelo Machine Learning (o datasheet só entra se o modelo não carregar)
+        metodo = "ml"
+        if not ml_disponivel():
+            st.error("🤖 Modelo de ML não carregou — julgando pelo datasheet por enquanto. Veja a aba 🔧 Admin ML.")
 
         # ---------------------------------------------------------------- ⚡ Placa
         st.subheader("⚡ Minha Placa (datasheet)")
