@@ -3,6 +3,8 @@
 # ============================================================================
 
 import re
+import os
+import sys
 import json
 import smtplib
 from email.mime.text import MIMEText
@@ -15,6 +17,10 @@ from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
 import requests
+
+# 🤖 Machine Learning (app/ml_solar.py — mesmo código usado no treino em ml/)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ml_solar as ml
 
 # ============================================================================
 # ✅ CONFIGURAÇÃO DA PÁGINA (com PWA)
@@ -223,12 +229,14 @@ CONFIG_PADRAO = {
     "deslocamento_rs": 0.0,     # R$ de deslocamento/equipamento por limpeza
     "outros_custos": 0.0,       # R$ de outros custos por limpeza
     "tarifa_kwh":    0.75,      # R$/kWh
+    "metodo":        "ml",      # julgamento: "ml" (Machine Learning) ou "datasheet"
 }
 
 # Valores em uso (aplicar_config troca pelos da barra lateral a cada execução)
 DS_MODELO       = CONFIG_PADRAO["modelo"]
 DS_TOLERANCIA_W = CONFIG_PADRAO["tolerancia_w"]
 DS_GAMMA_PMAX   = CONFIG_PADRAO["gamma_pct"] / 100.0
+METODO_JULGAMENTO = CONFIG_PADRAO["metodo"]
 
 def direcao_cardinal(azimute):
     """0° → N, 132° → SE, 270° → O…"""
@@ -265,7 +273,8 @@ def gravar_config(cfg):
 def aplicar_config(cfg):
     """Coloca a configuração em uso: todas as funções de cálculo leem estes globais."""
     global DS_MODELO, DS_TOLERANCIA_W, DS_GAMMA_PMAX, TARIFA_KWH
-    global PLACA_INCLINACAO_GRAUS, PLACA_AZIMUTE_GRAUS, LATITUDE, LONGITUDE
+    global PLACA_INCLINACAO_GRAUS, PLACA_AZIMUTE_GRAUS, LATITUDE, LONGITUDE, METODO_JULGAMENTO
+    METODO_JULGAMENTO      = cfg.get("metodo", "ml")
     DS_MODELO              = cfg["modelo"]
     DS_TOLERANCIA_W        = float(cfg["tolerancia_w"])
     DS_GAMMA_PMAX          = float(cfg["gamma_pct"]) / 100.0
@@ -1217,6 +1226,57 @@ def perda_vs_datasheet(df, placa, pmax, g_min=0.0, aoi_max=90.0):
         "rend_pct": e_real / e_min * 100 if e_min > 0 else 0.0,   # % do nominal (20 W)
     }
 
+# ----------------------------------------------------------------------------
+# 🤖 Julgamento por MACHINE LEARNING
+# ----------------------------------------------------------------------------
+# O modelo (XGBoost, treinado só com a placa limpa) prevê quanto uma placa LIMPA
+# geraria em cada leitura. A perda é o que faltou em relação a esse esperado.
+# Só entram leituras da janela usada no treino: 7h–13h, irradiação ≥ 100 W/m²,
+# 1 leitura a cada 15 min (ver app/ml_solar.py e ml/treinar_e_avaliar.py).
+
+@st.cache_resource(show_spinner=False)
+def carregar_ml():
+    """(modelos, info, avaliacao) — carregado uma vez por servidor."""
+    try:
+        return ml.carregar_modelos()
+    except Exception as e:  # sem joblib/xgboost instalado etc.
+        return {}, dict(ml.INFO_PADRAO, erros_carregamento={"geral": str(e)}), {}
+
+def ml_disponivel():
+    return ml.MODELO_PADRAO in carregar_ml()[0]
+
+def usando_ml():
+    """True quando o julgamento deve usar o modelo (escolhido na barra lateral e carregado)."""
+    return METODO_JULGAMENTO == "ml" and ml_disponivel()
+
+def limiar_sujeira_ml():
+    """% de perda acima da qual o ML considera a placa SUJA (1 − limiar do índice)."""
+    return (1 - carregar_ml()[1]["limiar_indice"]) * 100
+
+def preparar_ml(df, placa):
+    """Leituras de UMA placa no formato do modelo, já com a potência esperada (p_esp)."""
+    modelos, info, _ = carregar_ml()
+    d = ml.preparar_placa(df, placa["potencia"], placa["temperatura"], info)
+    if not d.empty:
+        d["p_esp"] = ml.prever(ml.MODELO_PADRAO, modelos, d, info)
+    return d
+
+def perda_vs_ml(df, placa):
+    """Mesmo formato de perda_vs_datasheet, mas o esperado vem do modelo de ML."""
+    d = preparar_ml(df, placa)
+    if d.empty:
+        return None
+    e_esp = ml.energia(d, "p_esp")
+    e_real = ml.energia(d, "potencia")
+    perda_wh = max(0.0, e_esp - e_real)
+    return {
+        "df": d, "e_min": e_esp, "e_max": e_esp, "e_real": e_real,
+        "perda_wh": perda_wh,
+        "perda_pct": perda_wh / e_esp * 100 if e_esp > 0 else 0.0,
+        "perda_rs": perda_wh / 1000.0 * TARIFA_KWH,
+        "rend_pct": e_real / e_esp * 100 if e_esp > 0 else 0.0,   # % do esperado pelo ML
+    }
+
 def _avaliar_placa(df, placa, pmax, custo_limpeza):
     """
     Julga UMA placa e devolve tudo que a tela precisa:
@@ -1229,10 +1289,21 @@ def _avaliar_placa(df, placa, pmax, custo_limpeza):
       compensa    : SUJA  e  req_custo
     """
     ultima = df.iloc[-1:]
-    p_min_agora, p_max_agora = faixa_datasheet(ultima, placa, pmax)
-    pv = perda_vs_datasheet(df, placa, pmax, g_min=IRRAD_MIN_JULGAMENTO, aoi_max=AOI_MAX_JULGAMENTO)
+    metodo = "ml" if usando_ml() else "datasheet"
+    if metodo == "ml":
+        pv = perda_vs_ml(df, placa)
+        limiar = limiar_sujeira_ml()
+        # esperado AGORA pelo modelo (só existe dentro da janela 7h–13h)
+        d_ult = preparar_ml(ultima, placa)
+        p_esp = float(d_ult["p_esp"].iloc[0]) if not d_ult.empty else np.nan
+        p_min_agora = p_max_agora = pd.Series([p_esp])
+    else:
+        pv = perda_vs_datasheet(df, placa, pmax, g_min=IRRAD_MIN_JULGAMENTO, aoi_max=AOI_MAX_JULGAMENTO)
+        limiar = LIMIAR_SUJEIRA
+        p_min_agora, p_max_agora = faixa_datasheet(ultima, placa, pmax)
 
     a = {
+        "metodo": metodo, "limiar": limiar,
         "pot_atual": ultima[placa["potencia"]].iloc[0],
         "p_min": p_min_agora.iloc[0], "p_max": p_max_agora.iloc[0],
         "t_placa": ultima[placa["temperatura"]].iloc[0] if placa["temperatura"] in ultima else None,
@@ -1262,12 +1333,12 @@ def _avaliar_placa(df, placa, pmax, custo_limpeza):
 
     if pv is None or a["e_min"] < ENERGIA_MIN_JULGAMENTO:
         a["veredito"] = "SEM SOL"
-    elif a["perda_pct"] > LIMIAR_SUJEIRA:
+    elif a["perda_pct"] > limiar:
         a["veredito"] = "SUJA"
     else:
         a["veredito"] = "LIMPA"
 
-    a["req_sujeira"] = a["perda_pct"] > LIMIAR_SUJEIRA
+    a["req_sujeira"] = a["perda_pct"] > limiar
     a["req_custo"] = a["perda_rs"] >= custo_limpeza
     a["compensa"] = a["veredito"] == "SUJA" and a["req_custo"]
     return a
@@ -1281,7 +1352,12 @@ def _bloco_veredito(placa, a):
     }
     bg, borda, texto, rotulo = estilos[a["veredito"]]
     if a["veredito"] == "SEM SOL":
-        sub = "irradiação baixa demais para julgar"
+        sub = ("sem leituras na janela do modelo (7h–13h com sol)" if a.get("metodo") == "ml"
+               else "irradiação baixa demais para julgar")
+    elif a.get("metodo") == "ml":
+        sub = (f"🤖 gerou {a['rend_pct']:.0f}% do esperado pelo modelo de ML "
+               f"({a['perda_pct']:.1f}% de perda)" if a["posicao"] == "abaixo"
+               else f"🤖 gerou {a['rend_pct']:.0f}% do esperado pelo modelo de ML — sem perda")
     elif a["posicao"] == "abaixo":
         sub = f"gerou {a['perda_pct']:.1f}% abaixo do mínimo do datasheet ({a['rend_pct']:.0f}% do nominal)"
     elif a["posicao"] == "dentro":
@@ -1305,9 +1381,10 @@ def _bloco_requisitos(a, custo_limpeza):
 
     sinal_suj = "&gt;" if a["req_sujeira"] else "≤"
     sinal_cus = "≥" if a["req_custo"] else "&lt;"
+    ref = "esperado pelo ML" if a.get("metodo") == "ml" else "mínimo do datasheet"
     linhas = (
-        linha(a["req_sujeira"], "Abaixo do mínimo do datasheet além do limiar",
-              f'{a["perda_pct"]:.1f}% {sinal_suj} {LIMIAR_SUJEIRA:.0f}%')
+        linha(a["req_sujeira"], f"Abaixo do {ref} além do limiar",
+              f'{a["perda_pct"]:.1f}% {sinal_suj} {a.get("limiar", LIMIAR_SUJEIRA):.0f}%')
         + linha(a["req_custo"], "Perda acumulada desde a limpeza paga a limpeza",
                 f'{_fmt_rs(a["perda_rs"])} {sinal_cus} {_fmt_rs(custo_limpeza)}')
     )
@@ -1409,19 +1486,46 @@ def _coluna_julgamento(df, placa, a, pmax, custo_limpeza, faixa_pot, origem, ago
     st.caption(f"📍 Julgando desde **{origem}** — {a['n_sol']} leituras na janela de julgamento{t_txt}.")
     _controles_limpeza(placa, agora)
 
+    usa_ml = a.get("metodo") == "ml"
     c1, c2 = st.columns(2)
     with c1:
         card("Potência medida", _fmt(a["pot_atual"]), "W (agora)", cor)
     with c2:
-        card("Potência esperada", f"{_fmt(a['p_min'])} – {_fmt(a['p_max'])}",
-             f"W ({pmax:.0f}–{pmax + DS_TOLERANCIA_W:.0f} W × G_placa/1000 × temp.)", "#facc15")
+        if usa_ml:
+            card("Potência esperada (ML)", _fmt(a["p_min"]),
+                 "W — modelo XGBoost (só 7h–13h)", "#facc15")
+        else:
+            card("Potência esperada", f"{_fmt(a['p_min'])} – {_fmt(a['p_max'])}",
+                 f"W ({pmax:.0f}–{pmax + DS_TOLERANCIA_W:.0f} W × G_placa/1000 × temp.)", "#facc15")
     c3, c4 = st.columns(2)
     with c3:
-        card("Energia gerada", _fmt(a["e_real"], 2), "Wh com sol", cor)
+        card("Energia gerada", _fmt(a["e_real"], 2), "Wh na janela de julgamento", cor)
     with c4:
-        card("Energia esperada", f"{_fmt(a['e_min'], 1)} – {_fmt(a['e_max'], 1)}", "Wh (faixa do datasheet)", "#facc15")
+        if usa_ml:
+            card("Energia esperada (ML)", _fmt(a["e_min"], 1), "Wh (placa limpa, previsto)", "#facc15")
+        else:
+            card("Energia esperada", f"{_fmt(a['e_min'], 1)} – {_fmt(a['e_max'], 1)}", "Wh (faixa do datasheet)", "#facc15")
 
     _bloco_requisitos(a, custo_limpeza)
+
+    if usa_ml:
+        d_ml = preparar_ml(df, placa)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=df["timestamp"], y=df[placa["potencia"]], name="Medida",
+            line=dict(color=cor, width=2.5),
+        ))
+        if not d_ml.empty:
+            fig.add_trace(go.Scatter(
+                x=d_ml["timestamp"], y=d_ml["p_esp"], name="Esperado pelo ML (placa limpa)",
+                mode="lines+markers", line=dict(color="#facc15", width=2, dash="dash"),
+                marker=dict(size=5),
+            ))
+        fig.update_layout(**LAY, title="Potência medida x esperada pelo ML (W)", yaxis_title="W", height=320)
+        if faixa_pot:
+            fig.update_yaxes(range=faixa_pot)
+        st.plotly_chart(fig, use_container_width=True, key=f"cmp_pot_{placa['potencia']}")
+        return
 
     p_min, p_max = faixa_datasheet(df, placa, pmax)
     fig = go.Figure()
@@ -1459,18 +1563,32 @@ def render_comparacao(custo_limpeza, pmax):
     hoje = agora.date()
 
     st.subheader("⚖️ Comparação — julgamento de cada placa")
-    st.caption(
-        f"Referência: datasheet **{DS_MODELO}** — {pmax:.0f} W com tolerância **0 a +{DS_TOLERANCIA_W:.0f} W**, "
-        f"corrigida pela temperatura da placa ({DS_GAMMA_PMAX*100:.2f} %/°C) e pela irradiação do sensor "
-        f"**convertida do plano horizontal para o plano da placa** ({PLACA_INCLINACAO_GRAUS:.0f}° de inclinação, "
-        f"virada a {PLACA_AZIMUTE_GRAUS:.0f}°). "
-        f"Gerou pelo menos o mínimo garantido → **LIMPA**; ficou mais de {LIMIAR_SUJEIRA:.0f}% abaixo → **SUJA**. "
-        f"Só entram no julgamento leituras com irradiação na placa ≥ {IRRAD_MIN_JULGAMENTO:.0f} W/m² e sol a "
-        f"no máximo {AOI_MAX_JULGAMENTO:.0f}° da perpendicular da placa — fora disso (sol muito de lado, fim de tarde) "
-        f"a leitura aparece no gráfico em cinza, mas não conta. "
-        f"**Limpar** quando a placa está SUJA **e** o que ela deixou de gerar desde a última limpeza "
-        f"(somado, em R$) já é maior ou igual ao custo da limpeza."
-    )
+    if usando_ml():
+        info_ml = carregar_ml()[1]
+        st.info(
+            f"🤖 **Julgamento por Machine Learning (XGBoost).** O modelo foi treinado só com a placa limpa "
+            f"({info_ml.get('n_treino', '—')} leituras, {info_ml.get('dias_treino', '—')} dias) e prevê quanto uma "
+            f"placa **limpa** geraria em cada leitura, a partir da irradiação do sensor, da posição do sol em relação "
+            f"à placa e das temperaturas. Entram só leituras de **7h às 13h** com irradiação ≥ "
+            f"{info_ml['irr_min']:.0f} W/m² (1 a cada 15 min). Gerou menos de "
+            f"{info_ml['limiar_indice']:.0%} do esperado → **SUJA**. "
+            f"Para usar a faixa do datasheet, troque o método na barra lateral."
+        )
+    elif METODO_JULGAMENTO == "ml":
+        st.warning("🤖 O modelo de ML não carregou — usando a faixa do datasheet. Veja a aba 🔧 Admin ML.")
+    if not usando_ml():
+        st.caption(
+            f"Referência: datasheet **{DS_MODELO}** — {pmax:.0f} W com tolerância **0 a +{DS_TOLERANCIA_W:.0f} W**, "
+            f"corrigida pela temperatura da placa ({DS_GAMMA_PMAX*100:.2f} %/°C) e pela irradiação do sensor "
+            f"**convertida do plano horizontal para o plano da placa** ({PLACA_INCLINACAO_GRAUS:.0f}° de inclinação, "
+            f"virada a {PLACA_AZIMUTE_GRAUS:.0f}°). "
+            f"Gerou pelo menos o mínimo garantido → **LIMPA**; ficou mais de {LIMIAR_SUJEIRA:.0f}% abaixo → **SUJA**. "
+            f"Só entram no julgamento leituras com irradiação na placa ≥ {IRRAD_MIN_JULGAMENTO:.0f} W/m² e sol a "
+            f"no máximo {AOI_MAX_JULGAMENTO:.0f}° da perpendicular da placa — fora disso (sol muito de lado, fim de tarde) "
+            f"a leitura aparece no gráfico em cinza, mas não conta. "
+            f"**Limpar** quando a placa está SUJA **e** o que ela deixou de gerar desde a última limpeza "
+            f"(somado, em R$) já é maior ou igual ao custo da limpeza."
+        )
 
     m1, m2 = st.columns([3, 1])
     with m1:
@@ -1744,8 +1862,12 @@ def render_previsao(df_sheets, custo_limpeza, pmax):
 
     # ------------------------------------------------------------------ 🚦 Diagnóstico
     st.subheader("🚦 Diagnóstico das placas")
-    st.caption(f"Mesmo critério da aba Comparação: faixa do datasheet ({pmax:.0f}–{pmax + DS_TOLERANCIA_W:.0f} W × G_placa/1000), "
-               "contada desde a última limpeza de cada placa.")
+    if usando_ml():
+        st.caption("Mesmo critério da aba Comparação: 🤖 geração real x esperada pelo modelo de ML (XGBoost), "
+                   "contada desde a última limpeza de cada placa.")
+    else:
+        st.caption(f"Mesmo critério da aba Comparação: faixa do datasheet ({pmax:.0f}–{pmax + DS_TOLERANCIA_W:.0f} W × G_placa/1000), "
+                   "contada desde a última limpeza de cada placa.")
 
     col_esq, col_dir = st.columns(2, gap="large")
     alertas, chaves = [], []
@@ -1760,7 +1882,8 @@ def render_previsao(df_sheets, custo_limpeza, pmax):
             st.caption(f"📍 Desde {origem} — {a['n_sol']} leituras na janela de julgamento.")
             if a["compensa"]:
                 chaves.append(f"{placa['nome']}@{origem}")
-                alertas.append(f"{placa['nome']}: {a['perda_pct']:.1f}% abaixo do mínimo do datasheet, "
+                ref = "do esperado pelo modelo de ML" if a.get("metodo") == "ml" else "do mínimo do datasheet"
+                alertas.append(f"{placa['nome']}: {a['perda_pct']:.1f}% abaixo {ref}, "
                                f"já deixou de gerar {_fmt_rs(a['perda_rs'])} desde a limpeza "
                                f"(≥ custo da limpeza {_fmt_rs(custo_limpeza)}).")
 
@@ -1891,6 +2014,279 @@ def render_previsao(df_sheets, custo_limpeza, pmax):
         st.caption("Sem previsão de chuva disponível agora.")
 
 # ============================================================================
+# 🔧 ABA ADMIN — COMPARAÇÃO DOS MODELOS DE ML
+# ============================================================================
+# Protegida pela senha 'admin_senha' dos Secrets do Streamlit Cloud.
+# Mostra (1) o modelo em uso, (2) a validação feita no treino e (3) como cada
+# modelo julga as duas placas DIA A DIA com os dados ao vivo do ThingSpeak.
+
+CORES_MODELOS = {
+    ml.FISICO: "#94a3b8",
+    "Regressão Linear": "#eda100",
+    "Random Forest": "#1baf7a",
+    "XGBoost": "#3987e5",
+}
+
+def _admin_liberado():
+    """Pede a senha de admin (Secrets → admin_senha). Sem senha configurada, libera com aviso."""
+    senha = _segredo("admin_senha", "")
+    if not senha:
+        st.warning("🔓 Nenhuma senha de admin configurada. Para proteger esta aba, adicione "
+                   "`admin_senha = \"sua-senha\"` em **Settings → Secrets** no Streamlit Cloud.")
+        return True
+    if st.session_state.get("admin_ok"):
+        return True
+    with st.form("form_admin"):
+        digitada = st.text_input("Senha de administrador", type="password")
+        if st.form_submit_button("Entrar"):
+            if digitada == senha:
+                st.session_state["admin_ok"] = True
+                st.rerun()
+            st.error("Senha incorreta.")
+    return False
+
+def _admin_validacao(avaliacao):
+    """Resultados da validação feita no treino (arquivo modelos/avaliacao.json)."""
+    st.markdown("### 📋 Validação no treino")
+    met = avaliacao.get("metodologia", {})
+    st.caption(" · ".join(met.values()))
+    resumo = pd.DataFrame(avaliacao.get("resumo", []))
+    if resumo.empty:
+        st.info("Sem resultados de validação (rode ml/treinar_e_avaliar.py).")
+        return
+    fmt = {c: "{:.3f}" for c in resumo.columns if c != "Modelo"}
+    for c in ["Acurácia", "Precisão", "Recall"]:
+        if c in fmt:
+            fmt[c] = "{:.1%}"
+    st.dataframe(resumo.style.format(fmt, na_rep="—"), use_container_width=True, hide_index=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = go.Figure(go.Bar(
+            x=resumo["Modelo"], y=resumo["Erro médio (%) média"],
+            marker_color=[CORES_MODELOS.get(m, "#cbd5e1") for m in resumo["Modelo"]],
+            text=[f"{v:.1f}%" for v in resumo["Erro médio (%) média"]], textposition="outside",
+            hovertemplate="%{x}<br>Erro médio: %{y:.2f}%<extra></extra>",
+        ))
+        fig.update_layout(**LAY, title="Erro médio de previsão (validação por dia)",
+                          yaxis_title="%", height=320, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True, key="adm_erro")
+    with c2:
+        fig = go.Figure()
+        for m in ["Acurácia", "Precisão", "Recall", "F1-score"]:
+            fig.add_trace(go.Bar(name=m, x=resumo["Modelo"], y=resumo[m],
+                                 hovertemplate=f"%{{x}}<br>{m}: %{{y:.1%}}<extra></extra>"))
+        fig.update_layout(**LAY, barmode="group", title="Classificação diária limpa × suja", height=320)
+        fig.update_yaxes(tickformat=".0%", range=[0, 1.08])
+        st.plotly_chart(fig, use_container_width=True, key="adm_cls")
+
+    matrizes = avaliacao.get("matrizes", {})
+    if matrizes:
+        nomes = [n for n in ml.ORDEM_MODELOS if n in matrizes]
+        fig = make_subplots(rows=1, cols=len(nomes), subplot_titles=nomes, horizontal_spacing=0.06)
+        for i, n in enumerate(nomes, 1):
+            m = np.array(matrizes[n])
+            fig.add_trace(go.Heatmap(
+                z=m, x=["Prev. limpa", "Prev. suja"], y=["Real limpa", "Real suja"],
+                colorscale=[[0, "#0b2239"], [1, "#3987e5"]], showscale=False,
+                text=m, texttemplate="%{text}", textfont=dict(size=16),
+                hovertemplate="%{y} → %{x}: %{z} dias<extra></extra>",
+            ), row=1, col=i)
+            fig.update_yaxes(autorange="reversed", row=1, col=i)
+        fig.update_layout(**{k: v for k, v in LAY.items() if k not in ("xaxis", "yaxis", "hovermode", "margin")},
+                          title="Matrizes de confusão (dias)", height=300, margin=dict(l=10, r=10, t=80, b=10))
+        st.plotly_chart(fig, use_container_width=True, key="adm_matrizes")
+
+    hora = pd.DataFrame(avaliacao.get("erro_por_hora", []))
+    est = pd.DataFrame(avaliacao.get("entre_estacoes", []))
+    c3, c4 = st.columns(2)
+    with c3:
+        if not hora.empty:
+            fig = go.Figure()
+            for n in ml.ORDEM_MODELOS[1:]:
+                if n in hora:
+                    fig.add_trace(go.Scatter(x=hora["Hora"], y=hora[n], name=n, mode="lines+markers",
+                                             line=dict(color=CORES_MODELOS[n], width=2)))
+            fig.update_layout(**LAY, title="Erro médio por hora do dia (W)", xaxis_title="hora", height=300)
+            st.plotly_chart(fig, use_container_width=True, key="adm_hora")
+    with c4:
+        if not est.empty:
+            st.markdown("**Generalização entre estações** (treina numa época, testa na outra)")
+            st.dataframe(est[["Treino → Teste", "Modelo", "Erro médio (%)", "R²"]]
+                         .style.format({"Erro médio (%)": "{:.1f}", "R²": "{:.3f}"}),
+                         use_container_width=True, hide_index=True, height=300)
+
+def _admin_diario(modelos, info):
+    """Como cada modelo julga cada placa, dia a dia, com os dados do ThingSpeak."""
+    st.markdown("### 📅 Comparação dia a dia (dados ao vivo)")
+    hoje = agora_brasil().date()
+    c1, c2 = st.columns(2)
+    with c1:
+        inicio = st.date_input("De:", value=hoje - pd.Timedelta(days=13), max_value=hoje, key="adm_ini")
+    with c2:
+        fim = st.date_input("Até:", value=hoje, max_value=hoje, key="adm_fim")
+    if inicio > fim:
+        st.error("A data 'De' não pode ser depois da data 'Até'.")
+        return
+    if (fim - inicio).days > 90:
+        st.warning("Período limitado a 90 dias.")
+        inicio = fim - pd.Timedelta(days=90)
+
+    with st.spinner("Buscando dados do ThingSpeak e rodando os modelos..."):
+        df = buscar_historico_thingspeak(inicio, fim)
+    if df.empty:
+        st.info("Sem leituras no período.")
+        return
+
+    resultados, tabelas = {}, []
+    for placa in (PLACA_LIMPA, PLACA_SUJA):
+        d = ml.preparar_placa(df, placa["potencia"], placa["temperatura"], info)
+        diario = ml.indice_diario(d, modelos, info)
+        resultados[placa["nome"]] = (d, diario)
+        if not diario.empty:
+            tabelas.append(diario.assign(placa=placa["nome"]))
+    if not tabelas:
+        st.info("Nenhuma leitura na janela do modelo (7h–13h com sol) no período.")
+        return
+    tudo = pd.concat(tabelas, ignore_index=True)
+    lim = info["limiar_indice"] * 100
+
+    # 1) Índice diário (real / esperado) de cada modelo — uma figura por placa
+    cols = st.columns(2)
+    for col, placa in zip(cols, (PLACA_LIMPA, PLACA_SUJA)):
+        diario = resultados[placa["nome"]][1]
+        with col:
+            fig = go.Figure()
+            for n in ml.ORDEM_MODELOS:
+                s = diario[diario["modelo"] == n] if not diario.empty else diario
+                if s.empty:
+                    continue
+                fig.add_trace(go.Scatter(
+                    x=s["data"], y=s["indice"] * 100, name=n, mode="lines+markers",
+                    line=dict(color=CORES_MODELOS[n], width=3 if n == ml.MODELO_PADRAO else 1.6),
+                    marker=dict(size=7 if n == ml.MODELO_PADRAO else 5),
+                    hovertemplate=f"{n}<br>%{{x|%d/%m}}: %{{y:.0f}}% do esperado<extra></extra>",
+                ))
+            fig.add_hline(y=100, line=dict(color="#e2e8f0", width=1, dash="dot"))
+            fig.add_hline(y=lim, line=dict(color="#ef4444", width=1, dash="dash"),
+                          annotation_text=f"limiar SUJA ({lim:.0f}%)", annotation_font_color="#fca5a5")
+            fig.update_layout(**LAY, title=f"{placa['emoji']} {placa['nome']} — geração real / esperada (%)",
+                              yaxis_title="% do esperado", height=360)
+            st.plotly_chart(fig, use_container_width=True, key=f"adm_idx_{placa['potencia']}")
+
+    st.caption("Cada ponto é um dia: energia gerada ÷ energia que o modelo esperava de uma placa **limpa** "
+               "(7h–13h). Perto de 100% = limpa; abaixo da linha vermelha = o modelo considera SUJA. "
+               "A fórmula física (cinza) não considera a orientação da placa, por isso oscila tanto.")
+    fim_treino = pd.Timestamp("2026-10-12").date()
+    if inicio <= fim_treino:
+        st.caption(f"⚠️ Dias até {fim_treino.strftime('%d/%m/%Y')} da placa limpa fizeram parte do treino — ali o "
+                   "acerto parece melhor do que é. Para números honestos use a seção **Validação no treino** "
+                   "(dias que o modelo nunca viu); dias novos já são teste de verdade.")
+
+    # 2) Erro diário de cada modelo na placa LIMPA (referência real)
+    diario_l = resultados[PLACA_LIMPA["nome"]][1]
+    if not diario_l.empty:
+        fig = go.Figure()
+        for n in ml.ORDEM_MODELOS[1:]:   # a fórmula física (erro ~35%) achataria as barras — ela está na tabela
+            s = diario_l[diario_l["modelo"] == n]
+            if s.empty:
+                continue
+            erro = (s["mae_w"] / (s["real_wh"] / s["leituras"] / 0.25) * 100)
+            fig.add_trace(go.Bar(x=s["data"], y=erro, name=n, marker_color=CORES_MODELOS[n],
+                                 hovertemplate=f"{n}<br>%{{x|%d/%m}}: erro médio %{{y:.1f}}%<extra></extra>"))
+        fig.update_layout(**LAY, barmode="group", height=320, yaxis_title="%",
+                          title="🟢 Placa limpa — erro médio de previsão por dia (quanto menor, melhor)")
+        st.plotly_chart(fig, use_container_width=True, key="adm_erro_dia")
+
+    # 3) Tabela: veredito de cada modelo por dia
+    tab = tudo.assign(valor=lambda t: t["indice"].map(lambda v: f"{v:.0%}" if pd.notna(v) else "—")
+                      + " " + np.where(t["veredito"] == "SUJA", "🚨", "✅"))
+    piv = tab.pivot_table(index=["data", "placa"], columns="modelo", values="valor", aggfunc="first")
+    piv = piv[[n for n in ml.ORDEM_MODELOS if n in piv.columns]].reset_index()
+    piv["data"] = pd.to_datetime(piv["data"]).dt.strftime("%d/%m/%Y")
+    st.markdown("**Veredito de cada modelo por dia** (% do esperado · ✅ limpa · 🚨 suja)")
+    st.dataframe(piv, use_container_width=True, hide_index=True)
+
+    # Concordância entre os modelos e o XGBoost
+    if ml.MODELO_PADRAO in tudo["modelo"].unique():
+        ref = tudo[tudo["modelo"] == ml.MODELO_PADRAO].set_index(["data", "placa"])["veredito"]
+        conc = []
+        for n in ml.ORDEM_MODELOS:
+            if n == ml.MODELO_PADRAO:
+                continue
+            s = tudo[tudo["modelo"] == n].set_index(["data", "placa"])["veredito"]
+            comum = ref.index.intersection(s.index)
+            if len(comum):
+                conc.append({"Modelo": n, "Concorda com o XGBoost": f"{(ref[comum] == s[comum]).mean():.0%}",
+                             "Dias": len(comum)})
+        if conc:
+            st.caption("Concordância com o modelo em uso: " +
+                       " · ".join(f"{c['Modelo']} {c['Concorda com o XGBoost']}" for c in conc))
+
+    # 4) Detalhe de um dia
+    st.markdown("#### 🔍 Detalhe de um dia")
+    dias = sorted(tudo["data"].unique())
+    e1, e2 = st.columns([1, 1])
+    with e1:
+        dia = st.selectbox("Dia", dias, index=len(dias) - 1, format_func=lambda x: x.strftime("%d/%m/%Y"),
+                           key="adm_dia")
+    with e2:
+        nome_placa = st.radio("Placa", [PLACA_LIMPA["nome"], PLACA_SUJA["nome"]], horizontal=True, key="adm_placa")
+    d = resultados[nome_placa][0]
+    d_dia = d[d["data"] == dia]
+    if d_dia.empty:
+        st.info("Sem leituras dessa placa nesse dia.")
+    else:
+        placa = PLACA_LIMPA if nome_placa == PLACA_LIMPA["nome"] else PLACA_SUJA
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=d_dia["timestamp"], y=d_dia["potencia"], name="Medida",
+                                 mode="lines+markers", line=dict(color=placa["cor"], width=3)))
+        for n in ml.ORDEM_MODELOS:
+            if n != ml.FISICO and n not in modelos:
+                continue
+            fig.add_trace(go.Scatter(x=d_dia["timestamp"], y=ml.prever(n, modelos, d_dia, info), name=n,
+                                     line=dict(color=CORES_MODELOS[n], width=1.8, dash="dash")))
+        fig.update_layout(**LAY, height=340, yaxis_title="W",
+                          title=f"{placa['emoji']} {nome_placa} em {dia.strftime('%d/%m/%Y')} — medida x esperada por modelo")
+        st.plotly_chart(fig, use_container_width=True, key="adm_detalhe")
+
+    csv = tudo.rename(columns={"real_wh": "energia_real_wh", "esperado_wh": "energia_esperada_wh",
+                               "mae_w": "erro_medio_w"}).to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Baixar comparação diária (CSV)", csv,
+                       file_name=f"comparacao_modelos_{inicio}_{fim}.csv", mime="text/csv")
+
+def render_admin_ml():
+    st.subheader("🔧 Admin — Machine Learning")
+    if not _admin_liberado():
+        return
+    modelos, info, avaliacao = carregar_ml()
+
+    # Modelo em uso
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        card("Modelo em uso", ml.MODELO_PADRAO if ml.MODELO_PADRAO in modelos else "—",
+             "julgamento das placas", "#3987e5")
+    with c2:
+        card("Treinado com", f"{info.get('n_treino', '—')}", f"leituras · {info.get('dias_treino', '—')} dias", "#facc15")
+    with c3:
+        card("Janela do modelo", f"{info['janela_inicio_h']}h–{info['janela_fim_h']}h",
+             f"irradiação ≥ {info['irr_min']:.0f} W/m²", "#67e8f9")
+    with c4:
+        card("Limiar de sujeira", f"{info['limiar_indice']:.0%}", "do esperado (abaixo = SUJA)", "#fca5a5")
+    st.caption(f"Treinado em {info.get('treinado_em', '—')} com dados de {info.get('periodo_treino', '—')}. "
+               f"Geometria do treino: lat {info['latitude']}, lon {info['longitude']}, "
+               f"{info['inclinacao']:.0f}° de inclinação, azimute {info['azimute']:.0f}°. "
+               f"Método de julgamento atual: **{'ML' if usando_ml() else 'datasheet'}**.")
+    erros = info.get("erros_carregamento") or {}
+    if erros:
+        st.error("Modelos que não carregaram: " + "; ".join(f"{k}: {v}" for k, v in erros.items()))
+
+    st.markdown("---")
+    _admin_diario(modelos, info)
+    st.markdown("---")
+    _admin_validacao(avaliacao)
+
+# ============================================================================
 # 🎯 FUNÇÃO PRINCIPAL
 # ============================================================================
 
@@ -1902,7 +2298,7 @@ def main():
     st.markdown(
         '<div style="display:inline-block;background:#0b3b24;border:1px solid #22c55e;'
         'color:#bbf7d0;border-radius:999px;padding:4px 14px;font-size:13px;font-weight:600;'
-        'margin:6px 0">🟢 versão 3.6 — revisão geral (correções + código enxuto)</div>',
+        'margin:6px 0">🟢 versão 4.0 — 🤖 Machine Learning (XGBoost) + aba Admin</div>',
         unsafe_allow_html=True,
     )
     st.markdown("---")
@@ -1921,6 +2317,17 @@ def main():
 
         def _num(rotulo, chave, **kw):
             return st.number_input(rotulo, key=f"cfg_{chave}", **kw)
+
+        # ---------------------------------------------------------------- 🧠 Método
+        st.subheader("🧠 Método de julgamento")
+        opcoes_metodo = {"ml": "🤖 Machine Learning (XGBoost)", "datasheet": "📄 Faixa do datasheet"}
+        if st.session_state.get("cfg_metodo") not in opcoes_metodo:
+            st.session_state["cfg_metodo"] = "ml"
+        metodo = st.radio("Como julgar se a placa está suja", list(opcoes_metodo),
+                          format_func=opcoes_metodo.get, key="cfg_metodo",
+                          label_visibility="collapsed")
+        if metodo == "ml" and not ml_disponivel():
+            st.error("Modelo de ML não carregou — usando o datasheet. Veja a aba 🔧 Admin ML.")
 
         # ---------------------------------------------------------------- ⚡ Placa
         st.subheader("⚡ Minha Placa (datasheet)")
@@ -1982,7 +2389,7 @@ def main():
             "inclinacao": inclinacao, "azimute": azimute, "latitude": latitude, "longitude": longitude,
             "agua_litros": agua_litros, "agua_preco_m3": agua_preco_m3, "produto_rs": produto_rs,
             "mao_obra_rs": mao_obra_rs, "deslocamento_rs": deslocamento_rs, "outros_custos": outros_custos,
-            "tarifa_kwh": tarifa,
+            "tarifa_kwh": tarifa, "metodo": metodo,
         }
         aplicar_config(cfg_atual)
 
@@ -2018,9 +2425,12 @@ def main():
     # 🧪 BOTÃO DE TESTE DE NOTIFICAÇÃO
     mostrar_botao_teste_notificacao()
 
-    tab1, tab2, tab_cmp, tab3 = st.tabs(
-        ["🌤️ Previsão", "☀️ Minha Placa ao Vivo", "⚖️ Comparação", "📧 E-mail"]
+    tab1, tab2, tab_cmp, tab3, tab_adm = st.tabs(
+        ["🌤️ Previsão", "☀️ Minha Placa ao Vivo", "⚖️ Comparação", "📧 E-mail", "🔧 Admin ML"]
     )
+
+    with tab_adm:
+        render_admin_ml()
 
     with tab2:
         render_placa_ao_vivo()
