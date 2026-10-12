@@ -1,0 +1,26 @@
+{
+  "latitude": -23.0903,
+  "longitude": -47.2181,
+  "fuso_h": -3.0,
+  "inclinacao": 23.0,
+  "azimute": 132.0,
+  "pmax": 20.0,
+  "janela_inicio_h": 7,
+  "janela_fim_h": 13,
+  "irr_min": 100.0,
+  "limiar_indice": 0.8,
+  "features": [
+    "irradiancia",
+    "cos_incidencia",
+    "cos_zenite",
+    "fator_geometrico",
+    "irr_no_plano",
+    "temp_placa",
+    "t_externa"
+  ],
+  "modelo_padrao": "XGBoost",
+  "n_treino": 1148,
+  "dias_treino": 69,
+  "periodo_treino": "31/03–11/04/2026 e 16/08–12/10/2026",
+  "treinado_em": "2026-10-12 12:59"
+}

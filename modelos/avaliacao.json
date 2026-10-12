@@ -1,0 +1,474 @@
+{
+ "resumo": [
+  {
+   "Modelo": "Fórmula física",
+   "MAE (W) média": 3.0378,
+   "MAE (W) desvio": 0.2264,
+   "RMSE (W) média": 3.5778,
+   "R² média": 0.6033,
+   "Erro médio (%) média": 34.0138,
+   "Viés (W) média": -1.2785,
+   "Erro em outra estação (%)": 36.9241,
+   "Acurácia": 0.7283,
+   "Precisão": 0.4792,
+   "Recall": 1.0,
+   "F1-score": 0.6479,
+   "AUC": 0.8135,
+   "Tempo de treino (s)": NaN,
+   "Previsão (µs/leitura)": NaN
+  },
+  {
+   "Modelo": "Regressão Linear",
+   "MAE (W) média": 0.7987,
+   "MAE (W) desvio": 0.0708,
+   "RMSE (W) média": 1.0391,
+   "R² média": 0.966,
+   "Erro médio (%) média": 8.9807,
+   "Viés (W) média": 0.0016,
+   "Erro em outra estação (%)": 9.8975,
+   "Acurácia": 0.8804,
+   "Precisão": 0.6875,
+   "Recall": 0.9565,
+   "F1-score": 0.8,
+   "AUC": 0.9307,
+   "Tempo de treino (s)": 0.0036,
+   "Previsão (µs/leitura)": 0.9851
+  },
+  {
+   "Modelo": "Random Forest",
+   "MAE (W) média": 0.4698,
+   "MAE (W) desvio": 0.0914,
+   "RMSE (W) média": 0.7126,
+   "R² média": 0.9837,
+   "Erro médio (%) média": 5.2234,
+   "Viés (W) média": 0.0105,
+   "Erro em outra estação (%)": 6.362,
+   "Acurácia": 0.9891,
+   "Precisão": 0.9583,
+   "Recall": 1.0,
+   "F1-score": 0.9787,
+   "AUC": 1.0,
+   "Tempo de treino (s)": 0.7785,
+   "Previsão (µs/leitura)": 74.0227
+  },
+  {
+   "Modelo": "XGBoost",
+   "MAE (W) média": 0.4506,
+   "MAE (W) desvio": 0.0828,
+   "RMSE (W) média": 0.6921,
+   "R² média": 0.9846,
+   "Erro médio (%) média": 5.0114,
+   "Viés (W) média": -0.0107,
+   "Erro em outra estação (%)": 6.3985,
+   "Acurácia": 0.9891,
+   "Precisão": 0.9583,
+   "Recall": 1.0,
+   "F1-score": 0.9787,
+   "AUC": 1.0,
+   "Tempo de treino (s)": 0.1881,
+   "Previsão (µs/leitura)": 3.863
+  }
+ ],
+ "regressao_por_fold": [
+  {
+   "Fold": 1,
+   "Modelo": "Fórmula física",
+   "MAE (W)": 2.7422,
+   "RMSE (W)": 3.2911,
+   "R²": 0.626,
+   "Erro médio (%)": 31.2659,
+   "Viés (W)": -0.9509
+  },
+  {
+   "Fold": 1,
+   "Modelo": "Regressão Linear",
+   "MAE (W)": 0.9058,
+   "RMSE (W)": 1.2058,
+   "R²": 0.9498,
+   "Erro médio (%)": 10.3282,
+   "Viés (W)": 0.3103
+  },
+  {
+   "Fold": 1,
+   "Modelo": "Random Forest",
+   "MAE (W)": 0.5543,
+   "RMSE (W)": 0.7972,
+   "R²": 0.9781,
+   "Erro médio (%)": 6.3198,
+   "Viés (W)": 0.204
+  },
+  {
+   "Fold": 1,
+   "Modelo": "XGBoost",
+   "MAE (W)": 0.5215,
+   "RMSE (W)": 0.7689,
+   "R²": 0.9796,
+   "Erro médio (%)": 5.9454,
+   "Viés (W)": 0.2124
+  },
+  {
+   "Fold": 2,
+   "Modelo": "Fórmula física",
+   "MAE (W)": 3.2635,
+   "RMSE (W)": 3.8285,
+   "R²": 0.4949,
+   "Erro médio (%)": 33.0967,
+   "Viés (W)": -1.7563
+  },
+  {
+   "Fold": 2,
+   "Modelo": "Regressão Linear",
+   "MAE (W)": 0.7722,
+   "RMSE (W)": 0.9942,
+   "R²": 0.9659,
+   "Erro médio (%)": 7.8318,
+   "Viés (W)": -0.1581
+  },
+  {
+   "Fold": 2,
+   "Modelo": "Random Forest",
+   "MAE (W)": 0.5216,
+   "RMSE (W)": 0.7811,
+   "R²": 0.979,
+   "Erro médio (%)": 5.2902,
+   "Viés (W)": -0.1184
+  },
+  {
+   "Fold": 2,
+   "Modelo": "XGBoost",
+   "MAE (W)": 0.5244,
+   "RMSE (W)": 0.8068,
+   "R²": 0.9776,
+   "Erro médio (%)": 5.3181,
+   "Viés (W)": -0.1741
+  },
+  {
+   "Fold": 3,
+   "Modelo": "Fórmula física",
+   "MAE (W)": 3.261,
+   "RMSE (W)": 3.8426,
+   "R²": 0.6031,
+   "Erro médio (%)": 33.7117,
+   "Viés (W)": -1.7189
+  },
+  {
+   "Fold": 3,
+   "Modelo": "Regressão Linear",
+   "MAE (W)": 0.7776,
+   "RMSE (W)": 1.034,
+   "R²": 0.9713,
+   "Erro médio (%)": 8.0383,
+   "Viés (W)": 0.0308
+  },
+  {
+   "Fold": 3,
+   "Modelo": "Random Forest",
+   "MAE (W)": 0.5316,
+   "RMSE (W)": 0.8355,
+   "R²": 0.9812,
+   "Erro médio (%)": 5.496,
+   "Viés (W)": 0.0166
+  },
+  {
+   "Fold": 3,
+   "Modelo": "XGBoost",
+   "MAE (W)": 0.4802,
+   "RMSE (W)": 0.7563,
+   "R²": 0.9846,
+   "Erro médio (%)": 4.9643,
+   "Viés (W)": -0.0261
+  },
+  {
+   "Fold": 4,
+   "Modelo": "Fórmula física",
+   "MAE (W)": 3.0124,
+   "RMSE (W)": 3.5025,
+   "R²": 0.648,
+   "Erro médio (%)": 36.9835,
+   "Viés (W)": -1.0001
+  },
+  {
+   "Fold": 4,
+   "Modelo": "Regressão Linear",
+   "MAE (W)": 0.8222,
+   "RMSE (W)": 1.0303,
+   "R²": 0.9695,
+   "Erro médio (%)": 10.094,
+   "Viés (W)": -0.2293
+  },
+  {
+   "Fold": 4,
+   "Modelo": "Random Forest",
+   "MAE (W)": 0.377,
+   "RMSE (W)": 0.5571,
+   "R²": 0.9911,
+   "Erro médio (%)": 4.6284,
+   "Viés (W)": -0.0791
+  },
+  {
+   "Fold": 4,
+   "Modelo": "XGBoost",
+   "MAE (W)": 0.3428,
+   "RMSE (W)": 0.5167,
+   "R²": 0.9923,
+   "Erro médio (%)": 4.2089,
+   "Viés (W)": -0.1073
+  },
+  {
+   "Fold": 5,
+   "Modelo": "Fórmula física",
+   "MAE (W)": 2.91,
+   "RMSE (W)": 3.4244,
+   "R²": 0.6444,
+   "Erro médio (%)": 35.011,
+   "Viés (W)": -0.9662
+  },
+  {
+   "Fold": 5,
+   "Modelo": "Regressão Linear",
+   "MAE (W)": 0.7157,
+   "RMSE (W)": 0.9314,
+   "R²": 0.9737,
+   "Erro médio (%)": 8.611,
+   "Viés (W)": 0.0545
+  },
+  {
+   "Fold": 5,
+   "Modelo": "Random Forest",
+   "MAE (W)": 0.3643,
+   "RMSE (W)": 0.5921,
+   "R²": 0.9894,
+   "Erro médio (%)": 4.383,
+   "Viés (W)": 0.0294
+  },
+  {
+   "Fold": 5,
+   "Modelo": "XGBoost",
+   "MAE (W)": 0.384,
+   "RMSE (W)": 0.612,
+   "R²": 0.9886,
+   "Erro médio (%)": 4.6201,
+   "Viés (W)": 0.0417
+  }
+ ],
+ "entre_estacoes": [
+  {
+   "Treino → Teste": "Ago/Out → Mar/Abr",
+   "Modelo": "Fórmula física",
+   "MAE (W)": 3.187,
+   "RMSE (W)": 3.6914,
+   "R²": 0.5915,
+   "Erro médio (%)": 36.9241,
+   "Viés (W)": -1.5111
+  },
+  {
+   "Treino → Teste": "Ago/Out → Mar/Abr",
+   "Modelo": "Regressão Linear",
+   "MAE (W)": 0.8543,
+   "RMSE (W)": 1.0182,
+   "R²": 0.9689,
+   "Erro médio (%)": 9.8975,
+   "Viés (W)": -0.1524
+  },
+  {
+   "Treino → Teste": "Ago/Out → Mar/Abr",
+   "Modelo": "Random Forest",
+   "MAE (W)": 0.5491,
+   "RMSE (W)": 0.7878,
+   "R²": 0.9814,
+   "Erro médio (%)": 6.362,
+   "Viés (W)": -0.3458
+  },
+  {
+   "Treino → Teste": "Ago/Out → Mar/Abr",
+   "Modelo": "XGBoost",
+   "MAE (W)": 0.5523,
+   "RMSE (W)": 0.7804,
+   "R²": 0.9817,
+   "Erro médio (%)": 6.3985,
+   "Viés (W)": -0.3166
+  },
+  {
+   "Treino → Teste": "Mar/Abr → Ago/Out",
+   "Modelo": "Fórmula física",
+   "MAE (W)": 3.0017,
+   "RMSE (W)": 3.5575,
+   "R²": 0.6162,
+   "Erro médio (%)": 33.2749,
+   "Viés (W)": -1.2213
+  },
+  {
+   "Treino → Teste": "Mar/Abr → Ago/Out",
+   "Modelo": "Regressão Linear",
+   "MAE (W)": 1.2639,
+   "RMSE (W)": 1.5987,
+   "R²": 0.9225,
+   "Erro médio (%)": 14.011,
+   "Viés (W)": 0.7027
+  },
+  {
+   "Treino → Teste": "Mar/Abr → Ago/Out",
+   "Modelo": "Random Forest",
+   "MAE (W)": 0.9156,
+   "RMSE (W)": 1.3021,
+   "R²": 0.9486,
+   "Erro médio (%)": 10.15,
+   "Viés (W)": 0.4934
+  },
+  {
+   "Treino → Teste": "Mar/Abr → Ago/Out",
+   "Modelo": "XGBoost",
+   "MAE (W)": 0.8345,
+   "RMSE (W)": 1.1883,
+   "R²": 0.9572,
+   "Erro médio (%)": 9.2508,
+   "Viés (W)": 0.3679
+  }
+ ],
+ "erro_por_hora": [
+  {
+   "Hora": 7,
+   "Fórmula física": 3.3556,
+   "Regressão Linear": 0.9194,
+   "Random Forest": 0.6325,
+   "XGBoost": 0.645
+  },
+  {
+   "Hora": 8,
+   "Fórmula física": 4.0634,
+   "Regressão Linear": 0.8613,
+   "Random Forest": 0.5798,
+   "XGBoost": 0.5896
+  },
+  {
+   "Hora": 9,
+   "Fórmula física": 4.1274,
+   "Regressão Linear": 0.9769,
+   "Random Forest": 0.5143,
+   "XGBoost": 0.4672
+  },
+  {
+   "Hora": 10,
+   "Fórmula física": 3.0254,
+   "Regressão Linear": 0.8476,
+   "Random Forest": 0.3979,
+   "XGBoost": 0.3705
+  },
+  {
+   "Hora": 11,
+   "Fórmula física": 1.8643,
+   "Regressão Linear": 0.6722,
+   "Random Forest": 0.3775,
+   "XGBoost": 0.3617
+  },
+  {
+   "Hora": 12,
+   "Fórmula física": 2.1364,
+   "Regressão Linear": 0.5998,
+   "Random Forest": 0.4279,
+   "XGBoost": 0.4024
+  }
+ ],
+ "classificacao": [
+  {
+   "Modelo": "Fórmula física",
+   "Acurácia": 0.7283,
+   "Precisão": 0.4792,
+   "Recall": 1.0,
+   "F1-score": 0.6479,
+   "AUC": 0.8135,
+   "VP": 23,
+   "FP": 25,
+   "FN": 0,
+   "VN": 44,
+   "Dias": 92
+  },
+  {
+   "Modelo": "Regressão Linear",
+   "Acurácia": 0.8804,
+   "Precisão": 0.6875,
+   "Recall": 0.9565,
+   "F1-score": 0.8,
+   "AUC": 0.9307,
+   "VP": 22,
+   "FP": 10,
+   "FN": 1,
+   "VN": 59,
+   "Dias": 92
+  },
+  {
+   "Modelo": "Random Forest",
+   "Acurácia": 0.9891,
+   "Precisão": 0.9583,
+   "Recall": 1.0,
+   "F1-score": 0.9787,
+   "AUC": 1.0,
+   "VP": 23,
+   "FP": 1,
+   "FN": 0,
+   "VN": 68,
+   "Dias": 92
+  },
+  {
+   "Modelo": "XGBoost",
+   "Acurácia": 0.9891,
+   "Precisão": 0.9583,
+   "Recall": 1.0,
+   "F1-score": 0.9787,
+   "AUC": 1.0,
+   "VP": 23,
+   "FP": 1,
+   "FN": 0,
+   "VN": 68,
+   "Dias": 92
+  }
+ ],
+ "matrizes": {
+  "Fórmula física": [
+   [
+    44,
+    25
+   ],
+   [
+    0,
+    23
+   ]
+  ],
+  "Regressão Linear": [
+   [
+    59,
+    10
+   ],
+   [
+    1,
+    22
+   ]
+  ],
+  "Random Forest": [
+   [
+    68,
+    1
+   ],
+   [
+    0,
+    23
+   ]
+  ],
+  "XGBoost": [
+   [
+    68,
+    1
+   ],
+   [
+    0,
+    23
+   ]
+  ]
+ },
+ "metodologia": {
+  "validacao": "Validação cruzada agrupada por dia (5 folds).",
+  "rotulos": "LIMPA = placa limpa (todos os dias); SUJA = placa suja a partir de 20/09/2026.",
+  "limiar": "Dia SUJO quando a energia real < 80% da esperada.",
+  "dados": "1148 leituras de 15 min, 69 dias, janela 7h–13h, irradiância ≥ 100 W/m²."
+ }
+}
