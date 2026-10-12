@@ -5,3 +5,7 @@ requests
 gspread
 google-auth
 streamlit-autorefresh
+# Machine Learning — mesmas versões usadas no treino (modelos/*.joblib)
+scikit-learn==1.9.1
+xgboost-cpu==3.4.1
+joblib
